@@ -12,6 +12,11 @@ export const PAGE_SIZE = 10;
 // is far past any account seen.
 export const MAX_PAGES = 1000;
 
+// A list whose pages bring no chat it had not given, this many in a row, is
+// cut: its paging is not moving on. One such page can be ordinary (chats that
+// move up between two calls shift a page), so it takes three.
+export const STALE_PAGES = 3;
+
 // The two list calls, in the order the spider has always made them.
 const VARIANTS: readonly (readonly unknown[])[] = [[1, null, 1], [0, null, 1]];
 
@@ -23,11 +28,12 @@ export type WalkStop =
   | { readonly kind: 'expired' };
 
 export interface WalkResult {
-  // Each chat once, in the order first listed. A chat in both lists carries
-  // the entry of the list walked last, [0,null,1].
+  // Each chat once, in the order first listed. A chat both lists give
+  // carries the entry with the later last-message time, and on a tie the
+  // entry of the list walked last, [0,null,1].
   readonly items: ListItem[];
   // False when any answer was read only in part: an error frame, a skipped
-  // entry, a cursor that did not move on, a list cut at maxPages, or a stop.
+  // entry, a list cut for not moving on or at maxPages, or a stop.
   readonly complete: boolean;
   // What ended the walk early, or null when it made every call it meant to.
   readonly stop: WalkStop | null;
@@ -55,6 +61,7 @@ export async function walkList({ client, sleep, crawlDelay, at, requestId, maxPa
     const seen = new Set<string>();
     const cursors = new Set<string>();
     let cursor: string | null = null;
+    let stale = 0;
     for (let pages = 1; ; pages += 1) {
       if (calls > 0) {
         await sleep(crawlDelay());
@@ -91,14 +98,19 @@ export async function walkList({ client, sleep, crawlDelay, at, requestId, maxPa
           seen.add(item.id);
           fresh += 1;
         }
-        items.set(item.id, item);
+        const kept = items.get(item.id);
+        if (kept === undefined || item.endedSec >= kept.endedSec) {
+          items.set(item.id, item);
+        }
       }
+      // Entries the parser skipped still show the paging moved on.
+      stale = fresh === 0 && page.skipped === 0 ? stale + 1 : 0;
       if (page.next === null) {
         break;
       }
-      // A cursor seen before, or a page of chats this list already gave, means
-      // the paging is not moving on; following it would never end.
-      if (cursors.has(page.next) || (page.items.length > 0 && fresh === 0) || pages >= maxPages) {
+      // A cursor this list gave before, or pages that keep bringing nothing
+      // new, mean the paging is not moving on; following it would never end.
+      if (cursors.has(page.next) || stale >= STALE_PAGES || pages >= maxPages) {
         log('a conversation list stopped moving on or ran past its page limit; it was cut there');
         complete = false;
         break;

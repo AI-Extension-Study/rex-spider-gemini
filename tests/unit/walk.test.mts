@@ -63,15 +63,42 @@ test('a cursor that comes back again ends that variant\'s paging and leaves the 
   assert.deepEqual({ ids: ids(result.items), complete: result.complete }, { ids: [chatId(1), chatId(2), chatId(3)], complete: false });
 });
 
-test('a page that brings no chat the variant had not listed ends its paging and leaves the walk incomplete', async () => {
+test('three pages in a row that bring no chat the list had not given end its paging, and the walk is incomplete', async () => {
   const run = walk({
     [key(OTHER, null)]: page([entry(1)], 'B2'),
     [key(OTHER, 'B2')]: page([entry(1)], 'B3'),
+    [key(OTHER, 'B3')]: page([entry(1)], 'B4'),
+    [key(OTHER, 'B4')]: page([entry(1)], 'B5'),
     [key(MAIN, null)]: page([]),
   });
   const result = await run.result;
-  assert.deepEqual(run.calls, [[10, null, OTHER], [10, 'B2', OTHER], [10, null, MAIN]]);
+  assert.deepEqual(run.calls, [[10, null, OTHER], [10, 'B2', OTHER], [10, 'B3', OTHER], [10, 'B4', OTHER], [10, null, MAIN]]);
   assert.equal(result.complete, false);
+});
+
+test('empty pages that keep handing out new cursors are cut after three', async () => {
+  const run = walk({
+    [key(OTHER, null)]: page([], 'B2'),
+    [key(OTHER, 'B2')]: page([], 'B3'),
+    [key(OTHER, 'B3')]: page([], 'B4'),
+    [key(MAIN, null)]: page([entry(1)]),
+  });
+  const result = await run.result;
+  assert.deepEqual(run.calls, [[10, null, OTHER], [10, 'B2', OTHER], [10, 'B3', OTHER], [10, null, MAIN]]);
+  assert.deepEqual({ ids: ids(result.items), complete: result.complete }, { ids: [chatId(1)], complete: false });
+});
+
+test('a page whose entries were all skipped still counts as paging moving on', async () => {
+  const bad = ['c_bad', 'Title', null, null, null, null];
+  const run = walk({
+    [key(OTHER, null)]: page([bad], 'B2'),
+    [key(OTHER, 'B2')]: page([bad], 'B3'),
+    [key(OTHER, 'B3')]: page([bad], 'B4'),
+    [key(OTHER, 'B4')]: page([entry(1)]),
+    [key(MAIN, null)]: page([]),
+  });
+  await run.result;
+  assert.deepEqual(run.calls, [[10, null, OTHER], [10, 'B2', OTHER], [10, 'B3', OTHER], [10, 'B4', OTHER], [10, null, MAIN]]);
 });
 
 test('a variant still handing out new cursors after maxPages pages is cut, and the walk is incomplete', async () => {
@@ -123,13 +150,23 @@ test('an answer that stops the walk keeps what came before and names why', async
   }
 });
 
-test('a chat listed in both variants is returned once, with the entry the main list gave it', async () => {
+test('a chat listed in both variants at one time is returned once, with the entry the main list gave it', async () => {
   const pinned = listEntry(1, 1700000000);
   const main = [...listEntry(1, 1700000000).slice(0, 9), 0];
   const run = walk({ [key(OTHER, null)]: page([pinned]), [key(MAIN, null)]: page([main, entry(2)]) });
   const result = await run.result;
   assert.deepEqual(ids(result.items), [chatId(1), chatId(2)]);
   assert.deepEqual(result.items[0].entry, main);
+});
+
+test('a chat the two lists give at different times is returned once, at the later time', async () => {
+  const newer = listEntry(1, 1700000500);
+  const older = listEntry(1, 1700000000);
+  for (const [first, second] of [[newer, older], [older, newer]]) {
+    const run = walk({ [key(OTHER, null)]: page([first]), [key(MAIN, null)]: page([second]) });
+    const result = await run.result;
+    assert.deepEqual(result.items.map((item) => [item.id, item.endedSec]), [[chatId(1), 1700000500]]);
+  }
 });
 
 test('every call carries the page token and the request id it was given', async () => {
