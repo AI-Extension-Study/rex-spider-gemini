@@ -26,6 +26,6 @@ self['rexSpiderPlugin'] = spiderPlugin
 self['rexGeminiPlugin'] = geminiSpider
 self['eventRecorder'] = recorder
 
+// The spider registers itself when its module loads, as in the extension, so
+// a spec sees a registration that went missing.
 corePlugin.setup()
-
-spiderPlugin.registerSpider(geminiSpider)
