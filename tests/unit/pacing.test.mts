@@ -78,6 +78,12 @@ test('a sleep of zero, a negative, a non-number or Infinity makes no call', asyn
   }
 });
 
+test('a crawl delay served as a numeric string is waited like its number', async () => {
+  const record = recorder();
+  await sleep('30000' as unknown as number, { keepAlive: record.keepAlive, wait: record.wait });
+  assert.deepEqual(record.events, ['keep-alive', 'wait 20000', 'keep-alive', 'wait 10000']);
+});
+
 test('without an injected wait, sleep waits on a real timer', async () => {
   const started = performance.now();
   await sleep(30, { keepAlive: () => undefined });

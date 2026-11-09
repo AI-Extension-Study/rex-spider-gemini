@@ -110,7 +110,7 @@ export class REXGeminiSpider extends REXSpider {
                 reject(`Unable to crawl the conversation list (${answer.kind})`)
               } else if (answer.status < 200 || answer.status > 299) {
                 if (checkedRecords.length === 0) {
-                  reject(`List fetch failed (status ${answer.status}).`)
+                  reject(`List fetch failed (status ${answer.status})`)
                 } else {
                   console.log(`[rex-spider-gemini] Error parsing conversation list. Transmitting gathered conversations. Status code: ${answer.status}`)
                   resolve([checkedRecords, false])

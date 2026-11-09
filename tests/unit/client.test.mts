@@ -154,3 +154,10 @@ test('without an injected fetch the client uses the global fetch', async () => {
   }
   assert.deepEqual(calls, ['https://gemini.google.com/app']);
 });
+
+test('a client made without a keep-alive makes and logs no keep-alive call', async () => {
+  const lines: string[] = [];
+  const client = createClient({ log: (line) => lines.push(line), fetch: answering(() => new Response('ok')) });
+  assert.deepEqual(await client.get('https://gemini.google.com/app'), { kind: 'ok', status: 200, text: 'ok' });
+  assert.deepEqual(lines, []);
+});

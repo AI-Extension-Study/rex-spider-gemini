@@ -35,12 +35,15 @@ export function touch(keepAlive: () => unknown, log: (line: string) => void = de
 }
 
 export async function sleep(ms: number, { keepAlive, wait = timer, log = defaultLog }: SleepOptions): Promise<void> {
-  // A wait that is not a finite number is no wait, as a bare timer treated it,
-  // so a broken crawl_delay cannot hold a crawl for good.
-  if (!Number.isFinite(ms)) {
+  // crawl_delay comes from the served config as it was written, so it is read
+  // as setTimeout would read it: a numeric string is its number, and anything
+  // that is not a finite number is no wait, so a broken value cannot hold a
+  // crawl for good.
+  const total = Number(ms);
+  if (!Number.isFinite(total)) {
     return;
   }
-  for (let left = ms; left > 0; left -= CHUNK_MS) {
+  for (let left = total; left > 0; left -= CHUNK_MS) {
     touch(keepAlive, log);
     await wait(Math.min(left, CHUNK_MS));
   }
