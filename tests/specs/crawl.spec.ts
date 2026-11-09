@@ -110,6 +110,15 @@ async function crawl(serviceWorker) {
 
 const records = (events) => events.filter((event) => event.name === 'rex-conversation')
 
+// The upload keys a build that sent summaries only left behind, as rex-spider
+// writes them: the bare chat id, the last-message time in ms, and the time
+// of the stamp as the value.
+async function seedSummaryKeys(serviceWorker, chats: [number, number][]) {
+  await serviceWorker.evaluate((keys) => Promise.all(keys.map((key) => new Promise((resolve) => {
+    self.rexCorePlugin.handleMessage({ messageType: 'storeValue', key, value: Date.now() }, null, resolve)
+  }))), chats.map(([n, seconds]) => `rex-spider-gemini-conversation-upload-${chat(n)}-${seconds * 1000}`))
+}
+
 // A summary record as the data-upload module receives it, every key.
 const summary = (n: number, seconds: number, ended: string) => ({
   name: 'rex-conversation',
@@ -182,9 +191,37 @@ test('served no summarize, a crawl reads each listed chat and sends detail recor
   expect(traffic.urls.filter((url) => !allowed.some((pattern) => new RegExp(pattern).test(url)))).toEqual([])
 })
 
-// The release serves no summarize, so its first pass is a switch to detail;
-// a config may later turn summary on, and off again.
+test('after an update, served summarize, the chats the old build sent are not sent again', async ({ context, serviceWorker }) => {
+  const traffic = await answerGemini(context, [entry(1, T), entry(2, T + 60)])
+  await untilStoreOpen(serviceWorker)
+  await seedSummaryKeys(serviceWorker, [[1, T], [2, T + 60]])
+  await configure(serviceWorker, { summarize: true })
+
+  const round = await crawl(serviceWorker)
+  expect(traffic.calls).toEqual(ONE_CRAWL)
+  expect(records(round.events)).toEqual([])
+  expect(completions(round.events)).toEqual([[0, [chat(1), chat(2)], 'Fetch successful.']])
+})
+
+// The release serves no summarize, so its first pass is a switch to detail.
+test('after an update, served no summarize, only the chats last used in the 90 days before it are re-sent, in detail', async ({ context, serviceWorker }) => {
+  const now = Math.floor(Date.now() / 1000)
+  const [old, recent] = [now - 100 * 86400, now - 3600]
+  const traffic = await answerGemini(context, [entry(1, old), entry(2, recent)])
+  await untilStoreOpen(serviceWorker)
+  await seedSummaryKeys(serviceWorker, [[1, old], [2, recent]])
+  await configure(serviceWorker)
+
+  const round = await crawl(serviceWorker)
+  expect(traffic.calls).toEqual([...ONE_CRAWL, READ_CALL(2)])
+  expect(records(round.events)).toEqual([detail(2, recent)])
+  expect(completions(round.events)).toEqual([[1, [chat(1), chat(2)], 'Fetch successful.']])
+})
+
+// A config may turn summary on later, and off again.
 test('a switch of mode re-sends only the chats last used in the 90 days before it, and the switch back takes', async ({ context, serviceWorker }) => {
+  // Four reads and a summary batch, each with a 3 s wait.
+  test.setTimeout(60_000)
   const now = Math.floor(Date.now() / 1000)
   const [old, recent] = [now - 100 * 86400, now - 3600]
   const listed = [entry(1, old), entry(2, recent)]
