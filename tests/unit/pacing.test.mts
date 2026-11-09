@@ -44,6 +44,22 @@ test('a keep-alive that throws or rejects is logged by error name and the sleep 
   assert.deepEqual(lines.sort(), ['keep-alive failed (RangeError)', 'keep-alive failed (TypeError)']);
 });
 
+test('a log that throws while reporting a failed keep-alive does not break the sleep', async () => {
+  const waits: number[] = [];
+  let calls = 0;
+  const keepAlive = () => {
+    calls += 1;
+    if (calls === 1) throw new TypeError('no storage');
+    return Promise.reject(new RangeError('quota'));
+  };
+  const log = () => {
+    throw new Error('log broke');
+  };
+  await sleep(25_000, { keepAlive, wait: async (ms) => { waits.push(ms); }, log });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(waits, [20_000, 5_000]);
+});
+
 test('a keep-alive that never answers does not hold the sleep', { timeout: 2000 }, async () => {
   const record = recorder();
   await sleep(10_000, { keepAlive: () => new Promise(() => {}), wait: record.wait });

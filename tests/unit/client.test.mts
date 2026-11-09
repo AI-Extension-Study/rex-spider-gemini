@@ -70,3 +70,34 @@ test('a fetch that rejects answers network', async () => {
 test('requests time out after 20 s unless told otherwise', () => {
   assert.equal(REQUEST_TIMEOUT_MS, 20_000);
 });
+
+test('a client made without a timeout aborts at 20 s, not before', { timeout: 2000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const client = createClient({ fetch: () => new Promise(() => {}) });
+  let settled = false;
+  const answer = client.get('https://gemini.google.com/app').then((value) => {
+    settled = true;
+    return value;
+  });
+  t.mock.timers.tick(19_999);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, 'ended before 20 s');
+  t.mock.timers.tick(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, true, 'still waiting at 20 s');
+  assert.deepEqual(await answer, { kind: 'timeout' });
+});
+
+test('a request that answered leaves no timer behind to abort its signal later', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let signal: AbortSignal | null = null;
+  const client = createClient({
+    fetch: async (_url, init) => {
+      signal = init.signal ?? null;
+      return new Response('ok');
+    },
+  });
+  assert.deepEqual(await client.get('https://gemini.google.com/app'), { kind: 'ok', status: 200, text: 'ok' });
+  t.mock.timers.tick(REQUEST_TIMEOUT_MS);
+  assert.equal((signal as AbortSignal | null)?.aborted, false, 'a timer aborted a request that had already answered');
+});
