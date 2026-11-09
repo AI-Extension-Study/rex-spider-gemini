@@ -4,13 +4,25 @@ import { type EventPayload, dispatchEvent } from '@bric/rex-core/service-worker'
 
 import rexSpiderPlugin, { REXSpider, type REXSpiderCrawlResult, type REXSpiderCrawlInspection } from '@bric/rex-spider/service-worker'
 
+import { type Client, createClient } from './client.mts'
 import { LIST_RPC, parseListPage, toConversation } from './list.mts'
+import { sleep } from './pacing.mts'
 import { bardErrorCodes, batchBody, batchUrl } from './wire.mts'
 
 const GEMINI_SPIDER_PAGE_SIZE = 10
 
+// A key nothing stores. Reading it is the cheap extension call that keeps the
+// worker awake through a wait (src/pacing.mts).
+const KEEP_ALIVE_KEY = 'rex-spider-gemini-keep-alive'
+
+function pause(ms:number): Promise<void> {
+  return sleep(ms, { keepAlive: () => chrome.storage.local.get(KEEP_ALIVE_KEY) })
+}
+
 export class REXGeminiSpider extends REXSpider {
   accessToken:string|null = null
+
+  client:Client = createClient()
 
   fetchUrls(): string[] {
     return []
@@ -91,23 +103,18 @@ export class REXGeminiSpider extends REXSpider {
           const args = pending.pop()
 
           if (args !== undefined) {
-            fetch(chatsUrl, {
-              method: 'POST',
-              credentials: 'include',
-              headers: {
-                'Content-Type': 'application/x-www-form-urlencoded'
-              },
-              body: batchBody(LIST_RPC, args, this.accessToken as string)
-            }).then((response: Response) => {
-              if (!response.ok) {
+            this.client.postForm(chatsUrl, batchBody(LIST_RPC, args, this.accessToken as string)).then((answer) => {
+              if (answer.kind !== 'ok') {
+                reject(`Unable to crawl the conversation list (${answer.kind}).`)
+              } else if (answer.status < 200 || answer.status > 299) {
                 if (checkedRecords.length === 0) {
-                  reject(`List fetch failed (status ${response.status}).`)
+                  reject(`List fetch failed (status ${answer.status}).`)
                 } else {
-                  console.log(`[rex-spider-gemini] Error parsing conversation list. Transmitting gathered conversations. Status code: ${response.status} - ${response.text}`)
+                  console.log(`[rex-spider-gemini] Error parsing conversation list. Transmitting gathered conversations. Status code: ${answer.status}`)
                   resolve([checkedRecords, false])
                 }
               } else {
-                response.text().then((rawBody) => {
+                Promise.resolve(answer.text).then((rawBody) => {
                   if (bardErrorCodes(rawBody).includes(1096)) {
                     console.log(`[rex-spider-gemini] Error parsing conversation list. Authorization has likely expired. (This will be fixed soon.)`)
                     resolve([checkedRecords, false])
@@ -131,7 +138,7 @@ export class REXGeminiSpider extends REXSpider {
 
                     complete = false
 
-                    setTimeout(fetchNext, this.fetchCrawlDelay())
+                    pause(this.fetchCrawlDelay()).then(fetchNext)
 
                     return
                   }
@@ -150,7 +157,7 @@ export class REXGeminiSpider extends REXSpider {
 
                   const checkNextConversation = () => {
                     if (parsed.length === 0) {
-                      setTimeout(fetchNext, this.fetchCrawlDelay())
+                      pause(this.fetchCrawlDelay()).then(fetchNext)
                     } else {
                       const nextConvo:Conversation | undefined = parsed.pop()
 
@@ -195,15 +202,15 @@ export class REXGeminiSpider extends REXSpider {
                   checkNextConversation()
                 })
                 .catch((err) => {
-                  reject(`Unable to retrieve body from ${chatsUrl}: ${err}.`)
+                  reject(`Unable to process the conversation list: ${err}.`)
                 })
               }
             }).catch((err) => {
-              reject(`Unable to crawl ${chatsUrl}: ${err}.`)
+              reject(`Unable to crawl the conversation list: ${err}.`)
             })
           } else {
-            setTimeout(fetchNext, this.fetchCrawlDelay())
-          }        
+            pause(this.fetchCrawlDelay()).then(fetchNext)
+          }
         }
       }
 
@@ -216,23 +223,29 @@ export class REXGeminiSpider extends REXSpider {
       super.doBackgroundCrawl().then((crawlResult:REXSpiderCrawlResult) => {
         const homeUrl = 'https://gemini.google.com/app'
 
-        fetch(homeUrl, {
-          method: 'GET',
-          credentials: 'include', // Crucial property to send cookies
-        }).then((response: Response) => {
+        this.client.get(homeUrl).then((answer) => {
           const crawledIds:string[] = []
 
-          if (!response.ok) {
-            this.signalCrawlComplete(-1, [], `Homepage fetch failed (status ${response.status}).`)
+          if (answer.kind !== 'ok') {
+            this.signalCrawlComplete(-1, [], `Error encountered fetching network resource: ${answer.kind}.`)
 
             crawlResult.issues.push({
               url: this.loginUrl(),
-              message: `Unable to fetch ${homeUrl}. Status code = ${response.status}.`
+              message: `Error encountered fetching network resource: ${answer.kind}.`
+            })
+
+            resolve(crawlResult)
+          } else if (answer.status < 200 || answer.status > 299) {
+            this.signalCrawlComplete(-1, [], `Homepage fetch failed (status ${answer.status}).`)
+
+            crawlResult.issues.push({
+              url: this.loginUrl(),
+              message: `Unable to fetch ${homeUrl}. Status code = ${answer.status}.`
             })
 
             resolve(crawlResult)
           } else {
-            response.text().then((rawHtml) => {
+            Promise.resolve(answer.text).then((rawHtml) => {
               if (rawHtml.includes('"SNlM0e":"')) {
                 const startIndex = rawHtml.indexOf('"SNlM0e":"')
 
