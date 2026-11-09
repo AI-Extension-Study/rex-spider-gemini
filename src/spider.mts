@@ -44,9 +44,32 @@ export class REXGeminiSpider extends REXSpider {
     return [];
   }
 
-  async checkLogin(): Promise<boolean> {
-    const answer = await this.client.get(this.loginUrl());
-    return answer.kind === 'ok' && answer.status >= 200 && answer.status < 300 && !answer.text.includes('<span class="gb_ie">Sign in</span>');
+  // Moved unchanged from the old entry file. Nothing calls it.
+  checkLogin(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      fetch(this.loginUrl()).then((response: Response) => {
+        if (response.ok) {
+          response.text().then((rawHtml) => {
+            if (rawHtml.includes("<span class=\"gb_ie\">Sign in</span>")) {
+                resolve(false)
+            } else {
+              resolve(true)
+            }
+          })
+          .catch((err) => {
+            console.log(`[rex-spider-gemini] Error fetching login page text (${this.loginUrl()}): ${err}`)
+
+            resolve(false)
+          })
+        } else {
+          resolve(false)
+        }
+      }).catch((err) => {
+        console.log(`[rex-spider-gemini] Error fetching login page (${this.loginUrl()}): ${err}`)
+
+        resolve(false)
+      })
+    })
   }
 
   // The base stamps the crawl's start and sets its crawling flag. The pass
