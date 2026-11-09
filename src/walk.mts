@@ -96,7 +96,7 @@ export async function walkList({ client, sleep, crawlDelay, at, requestId, maxPa
         break;
       }
       if (page.skipped > 0) {
-        log(`skipped ${page.skipped} conversation list entries without an id or a time`);
+        log(`skipped ${page.skipped} conversation list entries without a chat id in its form or a time`);
         complete = false;
       }
       let fresh = 0;

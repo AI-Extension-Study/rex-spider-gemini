@@ -68,15 +68,21 @@ const turnOf = (exchange: Exchange): GeminiTurn => ({
 
 // started is set only when the read came back whole, since otherwise the
 // oldest exchange may be missing. It is whole seconds, as ended is (the
-// upload key is built from ended), so a chat never starts after it ends; the
-// nanoseconds stay in each turn's when, so the newest turn's when can be up
-// to a second past ended. The read sends exchanges newest first: reversed
-// before the stable sort, two exchanges with one time keep their order, a
-// reply after the prompt it answers.
+// upload key is built from ended); the nanoseconds stay in each turn's when.
+// The list is read before the chats are, so a chat that gains messages in
+// between has turns after ended; the next pass sends it again under its new
+// ended. The read sends exchanges newest first: reversed before the stable
+// sort, two exchanges with one time keep their order, a reply after the
+// prompt it answers.
 export function buildDetailRecord(item: ListItem, read: Extract<ReadResult, { kind: 'read' }>): GeminiRecord {
   const summary = buildSummaryRecord(item);
   const oldestFirst = [...read.exchanges].reverse().sort((a, b) => a.whenSec - b.whenSec || a.whenNanos - b.whenNanos);
-  const started = read.whole && oldestFirst.length > 0 ? new DateString(oldestFirst[0].whenSec) : undefined;
+  // A start after the listed end means the chat's oldest exchange changed
+  // between the list call and the read (its first prompt edited, say): the
+  // list's time is stale, and a start after it would make the record
+  // inconsistent, so it is left out, as for a read that was cut.
+  const oldest = oldestFirst.length > 0 ? oldestFirst[0] : undefined;
+  const started = read.whole && oldest !== undefined && oldest.whenSec <= item.endedSec ? new DateString(oldest.whenSec) : undefined;
   return {
     ...summary,
     is_summary: false,
