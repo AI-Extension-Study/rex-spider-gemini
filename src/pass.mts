@@ -7,7 +7,7 @@ import type { DateString } from '@bric/rex-types/types';
 
 import { type Client } from './client.mts';
 import { uploadKeyId } from './keys.mts';
-import { TIMED_OUT, withDeadline } from './pacing.mts';
+import { TIMED_OUT, touch, withDeadline } from './pacing.mts';
 import { DISABLED, FETCH_SUCCESSFUL, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
 import { type GeminiRecord, buildSummaryRecord } from './record.mts';
 import { type WalkStop, walkList } from './walk.mts';
@@ -51,7 +51,7 @@ export interface PassDeps {
   readonly framework: PassFramework;
   readonly dispatch: (record: GeminiRecord) => void;
   readonly sleep: (ms: number) => Promise<void>;
-  readonly keepAlive: () => void;
+  readonly keepAlive: () => unknown;
   readonly requestId: number;
   readonly limits?: PassLimits;
   readonly log?: (line: string) => void;
@@ -74,8 +74,9 @@ class StoreSilent extends Error {}
 
 // One store call to its deadline, after a keep-alive call: store calls do
 // not reset the worker's idle timer, and one may take most of the deadline.
-async function step<T>(call: () => Promise<T>, ms: number, keepAlive: () => void): Promise<T> {
-  keepAlive();
+// touch() makes the call without waiting on it and logs a failed one.
+async function step<T>(call: () => Promise<T>, ms: number, keepAlive: () => unknown, log: (line: string) => void): Promise<T> {
+  touch(keepAlive, log);
   const answer = await withDeadline(call(), ms);
   if (answer === TIMED_OUT) {
     throw new StoreSilent();
@@ -130,11 +131,11 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (!stopsBeforeSending) {
       for (const item of walk.items) {
         const record = buildSummaryRecord(item);
-        if (!(await step(() => framework.crawlWindowContains(record.ended.timestamp()), limits.storeMs, deps.keepAlive))) {
+        if (!(await step(() => framework.crawlWindowContains(record.ended.timestamp()), limits.storeMs, deps.keepAlive, log))) {
           continue;
         }
         crawledIds.push(item.id);
-        if (!(await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), record.ended), limits.storeMs, deps.keepAlive))) {
+        if (!(await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), record.ended), limits.storeMs, deps.keepAlive, log))) {
           unsent.push(record);
         }
       }
@@ -179,7 +180,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
         // none are, and they go out next pass instead of twice. The records
         // already sent stay counted.
         try {
-          await step(() => framework.logTransmitted(uploadKeyId(record.identifier, true), record.ended), limits.storeMs, deps.keepAlive);
+          await step(() => framework.logTransmitted(uploadKeyId(record.identifier, true), record.ended), limits.storeMs, deps.keepAlive, log);
         } catch (error) {
           log(`a stamp ${error instanceof StoreSilent ? 'got no answer' : `failed (${error instanceof Error ? error.name : typeof error})`}; sending stops for this pass`);
           stampsStopped = true;

@@ -299,6 +299,56 @@ test('an internal error is logged by the error\'s kind, never its message', asyn
     limits: { settleMs: 1500, batch: 25, storeMs: 20 },
     log: (line) => lines.push(line),
   });
-  assert.ok(lines.some((line) => line.includes('internal error (TypeError)')), lines.join('\n'));
+  assert.ok(lines.some((line) => line.includes('internal error (TypeError)')), `no line named the internal error:\n${lines.join('\n')}`);
   assert.ok(lines.every((line) => !line.includes('secret detail')), lines.join('\n'));
+});
+
+test('each store call comes right after its keep-alive call', async () => {
+  const order: string[] = [];
+  const side = framework();
+  const { crawlWindowContains, checkIfAlreadyTransmitted, logTransmitted } = side.fw;
+  side.fw.crawlWindowContains = (ms) => {
+    order.push('window');
+    return crawlWindowContains(ms);
+  };
+  side.fw.checkIfAlreadyTransmitted = (id, ended) => {
+    order.push('read');
+    return checkIfAlreadyTransmitted(id, ended);
+  };
+  side.fw.logTransmitted = (id, ended) => {
+    order.push('stamp');
+    return logTransmitted(id, ended);
+  };
+  await runPass({
+    client: client({ main: listPage(entries(1)) }),
+    framework: side.fw,
+    dispatch: () => {},
+    sleep: async () => {},
+    keepAlive: () => {
+      order.push('keep-alive');
+    },
+    requestId: 1,
+    limits: { settleMs: 1500, batch: 25, storeMs: 20 },
+    log: () => {},
+  });
+  assert.deepEqual(order, ['keep-alive', 'window', 'keep-alive', 'read', 'keep-alive', 'stamp']);
+});
+
+test('a keep-alive that throws or rejects is logged and the pass goes on', async () => {
+  for (const keepAlive of [() => { throw new TypeError('no storage'); }, () => Promise.reject(new TypeError('no storage'))]) {
+    const lines: string[] = [];
+    const outcome = await runPass({
+      client: client({ main: listPage(entries(2)) }),
+      framework: framework().fw,
+      dispatch: () => {},
+      sleep: async () => {},
+      keepAlive,
+      requestId: 1,
+      limits: { settleMs: 1500, batch: 25, storeMs: 20 },
+      log: (line) => lines.push(line),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual([outcome.crawledCount, outcome.reason], [2, 'Fetch successful.']);
+    assert.ok(lines.some((line) => line.includes('keep-alive failed (TypeError)')), `the failed keep-alive was not logged:\n${lines.join('\n')}`);
+  }
 });
