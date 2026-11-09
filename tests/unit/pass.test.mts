@@ -886,6 +886,15 @@ test('chats held back by a memo neither count toward the run of failed reads nor
   assert.deepEqual([readsOf(fake), run.outcome.reason], [[chatId(5), chatId(3), chatId(2)], STOPPED]);
 });
 
+test('a 429 says the server asked to wait with halt_on_error too, and after a list read only in part keeps the partial reason', async () => {
+  const wait = 'Crawl stopped: the server asked to wait.';
+  const limited: Answer = { kind: 'ok', status: 429, text: '' };
+  const halted = await pass(client({ main: listPage(entries(1)), reads: { [chatId(1)]: limited } }), framework({ summarize: false, haltOnError: true }));
+  assert.deepEqual([halted.outcome.reason, halted.outcome.issue], [wait, wait], 'halt_on_error');
+  const partial = await pass(client({ other: ERROR_FRAME, main: listPage(entries(1)), reads: { [chatId(1)]: limited } }), framework({ summarize: false }));
+  assert.deepEqual([partial.outcome.reason, partial.outcome.issue], ['Full fetch unsuccessful. Partial results returned.', wait], 'partial list');
+});
+
 test('chats that fail again count toward the run of failed reads too', async () => {
   // A read that fails for every chat would otherwise run through all the
   // chats whose memos ran out, up to the budget.
