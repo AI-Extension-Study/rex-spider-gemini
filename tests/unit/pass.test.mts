@@ -54,7 +54,9 @@ function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Rec
 // and the upload keys a browser holds, keyed as rex-spider keys them (id and
 // ended in ms). A stamp adds its key, so a later pass on the same side sees
 // it. Summary mode unless a test serves detail.
-function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
+// unkeptStamps: a stamp that is answered but not written, as rex-spider's
+// logTransmitted resolves after a failed write.
+function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stamped: string[] = [];
   const events: string[] = [];
@@ -73,10 +75,11 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
     logTransmitted: (id: string, ended: DateString) => {
       counts.stampTries += 1;
       if (silentStamps) return new Promise(() => {});
+      events.push(`stamp ${id}`);
+      if (unkeptStamps) return Promise.resolve();
       const key = `${id} ${Math.round(ended.timestamp())}`;
       keys.add(key);
       stamped.push(key);
-      events.push(`stamp ${id}`);
       return Promise.resolve();
     },
     fetchCrawlDelay: () => crawlDelay as number,
@@ -292,8 +295,9 @@ test('every store call is preceded by a keep-alive call', async () => {
   const store = modes();
   const run = await pass(client({ main: listPage(entries(3)) }), side, {}, { store });
   assert.equal(run.keepAlives, side.counts.windows + side.counts.reads + side.counts.stampTries + store.counts.gets + store.counts.sets);
-  // Two key reads for each unsent chat: its key in the served mode, then in the other.
-  assert.deepEqual([side.counts.windows, side.counts.reads, side.counts.stampTries, store.counts.gets, store.counts.sets], [3, 5, 2, 1, 1], 'Test setup invalid: the pass made other store calls than expected');
+  // Two key reads for each unsent chat, its key in the served mode, then in
+  // the other; and one after each stamp, reading it back.
+  assert.deepEqual([side.counts.windows, side.counts.reads, side.counts.stampTries, store.counts.gets, store.counts.sets], [3, 7, 2, 1, 1], 'Test setup invalid: the pass made other store calls than expected');
 });
 
 test('a dispatch that throws is logged, its key is not stamped, and the pass goes on', async () => {
@@ -454,7 +458,7 @@ test('each store call comes right after its keep-alive call', async () => {
     limits: LIMITS,
     log: () => {},
   });
-  assert.deepEqual(order, ['keep-alive', 'mode read', 'keep-alive', 'mode write', 'keep-alive', 'window', 'keep-alive', 'read', 'keep-alive', 'read', 'keep-alive', 'stamp']);
+  assert.deepEqual(order, ['keep-alive', 'mode read', 'keep-alive', 'mode write', 'keep-alive', 'window', 'keep-alive', 'read', 'keep-alive', 'read', 'keep-alive', 'stamp', 'keep-alive', 'read']);
 });
 
 test('a keep-alive that throws or rejects is logged and the pass goes on', async () => {
@@ -512,12 +516,12 @@ test('in detail mode a key is stamped after the wait that follows its record', a
   ]);
 });
 
-test('a crawl_delay shorter than the settle wait, or not a number, still leaves the settle wait before a stamp', async () => {
-  for (const [crawlDelay, pace] of [[10, 10], ['soon', 0], [-5, 0]] as const) {
+test('a crawl_delay shorter than the settle wait, or not a number, still leaves the settle wait between reads and before a stamp', async () => {
+  for (const crawlDelay of [10, 'soon', -5]) {
     const side = framework({ summarize: false, crawlDelay });
     await pass(client({ main: listPage(entries(2)) }), side);
     assert.deepEqual(side.events.slice(1), [
-      `wait ${pace}`, `read ${chatId(2)}`, `dispatch ${chatId(2)}`,
+      'wait 1500', `read ${chatId(2)}`, `dispatch ${chatId(2)}`,
       'wait 1500', `stamp ${chatId(2)}-detail`, `read ${chatId(1)}`, `dispatch ${chatId(1)}`,
       'wait 1500', `stamp ${chatId(1)}-detail`,
     ], String(crawlDelay));
@@ -532,6 +536,8 @@ test('the reads stop once the detail budget is spent, and the chats not reached 
   const run = await pass(fake, side, { detailBudgetMs: 90_000 });
   assert.deepEqual(readsOf(fake), [chatId(5), chatId(4), chatId(3)]);
   assert.deepEqual(keysOf(side), [`${chatId(5)}-detail`, `${chatId(4)}-detail`, `${chatId(3)}-detail`]);
+  // The record sent last waits out the settle time before its stamp.
+  assert.deepEqual(side.events.slice(-3), [`dispatch ${chatId(3)}`, 'wait 1500', `stamp ${chatId(3)}-detail`]);
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [3, 'Fetch successful.']);
 });
 
@@ -550,7 +556,8 @@ test('a failed read sends and stamps nothing for its chat, and the reads go on',
   const cases: [string, Answer][] = [
     ['a timeout', { kind: 'timeout' }],
     ['a network failure', { kind: 'network' }],
-    ['HTTP 500', { kind: 'ok', status: 500, text: '' }],
+    // With a body that reads as a read, so only the status can fail it.
+    ['HTTP 500', { kind: 'ok', status: 500, text: readResponse([exchange({ chat: chatId(2), response: 1, seconds: T - 60 })]) }],
     ['an error frame', { kind: 'ok', status: 200, text: batchResponse(wrbError('hNvQHb', 5)) }],
     ['HTML', { kind: 'ok', status: 200, text: '<html></html>' }],
   ];
@@ -562,12 +569,23 @@ test('a failed read sends and stamps nothing for its chat, and the reads go on',
   }
 });
 
-test('an expired session ends the reads', async () => {
-  const fake = client({ main: listPage(entries(2)), reads: { [chatId(2)]: EXPIRED_READ } });
+test('an expired session ends the reads, after the record sent before it was stamped', async () => {
+  const fake = client({ main: listPage(entries(3)), reads: { [chatId(2)]: EXPIRED_READ } });
   const side = framework({ summarize: false });
   const run = await pass(fake, side);
-  assert.deepEqual([readsOf(fake), run.sent, side.stamped], [[chatId(2)], [], []]);
-  assert.deepEqual(run.outcome, { crawledCount: 0, crawledIds: [chatId(1), chatId(2)], reason: 'Fetch successful.', issue: null });
+  assert.deepEqual([readsOf(fake), run.sent.map((record) => record.identifier)], [[chatId(3), chatId(2)], [chatId(3)]]);
+  assert.deepEqual(side.events.slice(-3), ['wait 30000', `stamp ${chatId(3)}-detail`, `read ${chatId(2)}`]);
+  assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1), chatId(2), chatId(3)], reason: 'Fetch successful.', issue: null });
+});
+
+test('a stamp the store does not keep stops the sending, in either mode', async () => {
+  const summary = framework({ unkeptStamps: true });
+  const inSummary = await pass(client({ main: listPage(entries(3)) }), summary, { batch: 2 });
+  assert.deepEqual([inSummary.sent.length, summary.counts.stampTries, inSummary.outcome.crawledCount], [2, 1, 2], 'summary');
+  const fake = client({ main: listPage(entries(3)) });
+  const detail = framework({ summarize: false, unkeptStamps: true });
+  const inDetail = await pass(fake, detail);
+  assert.deepEqual([readsOf(fake), detail.counts.stampTries, inDetail.outcome.crawledCount], [[chatId(3)], 1, 1], 'detail');
 });
 
 test('a stamp that gets no answer stops the reads', { timeout: 2000 }, async () => {

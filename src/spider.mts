@@ -28,6 +28,9 @@ export class REXGeminiSpider extends REXSpider {
   // would not take.
   summarizes = false;
 
+  // rex-spider calls this on each refresh whose config has a block for this
+  // spider or a default one. With neither, the mode last served stays until
+  // the worker restarts, as enabled does.
   updateConfiguration(configuration: Parameters<REXSpider['updateConfiguration']>[0]): void {
     super.updateConfiguration(configuration);
     this.summarizes = configuration.summarize === true;

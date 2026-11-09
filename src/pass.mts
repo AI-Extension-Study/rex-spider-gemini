@@ -152,14 +152,21 @@ function dispatched(ctx: Sending, record: GeminiRecord): boolean {
   }
 }
 
-// Stamps a sent record's key, in the record's own mode. A stamp that fails,
-// or gets no answer, stops the stamping and the sending: records sent from
-// here on could not be stamped either, so none are, and they go out next pass
-// instead of twice. The records already sent stay counted.
+// Stamps a sent record's key, in the record's own mode, and reads it back:
+// rex-spider's logTransmitted resolves whatever the store answers, a failed
+// write included. A stamp that fails, is not kept, or gets no answer stops
+// the stamping and the sending: records sent from here on could not be
+// stamped either, so none are, and they go out next pass instead of twice.
+// The records already sent stay counted.
 async function stamped(ctx: Sending, record: GeminiRecord): Promise<boolean> {
   const { framework, keepAlive } = ctx.deps;
+  const id = uploadKeyId(record.identifier, record.is_summary);
   try {
-    await step(() => framework.logTransmitted(uploadKeyId(record.identifier, record.is_summary), record.ended), ctx.limits.storeMs, keepAlive, ctx.log);
+    await step(() => framework.logTransmitted(id, record.ended), ctx.limits.storeMs, keepAlive, ctx.log);
+    if (!(await step(() => framework.checkIfAlreadyTransmitted(id, record.ended), ctx.limits.storeMs, keepAlive, ctx.log))) {
+      ctx.log('a stamp was not kept; sending stops for this pass');
+      return false;
+    }
     return true;
   } catch (error) {
     ctx.log(`a stamp ${error instanceof StoreSilent ? 'got no answer' : `failed (${kindOf(error)})`}; sending stops for this pass`);
@@ -193,7 +200,7 @@ async function sendSummaries(ctx: Sending, records: readonly GeminiRecord[]): Pr
 }
 
 // crawl_delay as a wait. A value that is not a positive number is no wait, as
-// a bare timer takes it; the settle wait before a stamp still holds.
+// a bare timer takes it; the reads still keep the settle wait between them.
 function paceMs(framework: PassFramework): number {
   const delay = Number(framework.fetchCrawlDelay());
   return Number.isFinite(delay) && delay > 0 ? delay : 0;
@@ -210,11 +217,12 @@ function readFailure(answer: Answer, read: Exclude<ReadResult, { kind: 'read' }>
   return read.kind === 'error' ? `error frame, code ${read.code}` : 'not a read';
 }
 
-// Detail mode: each chat read in turn, crawl_delay apart, until the detail
-// budget is spent. A record's key is stamped after the wait before the next
-// read, which is then at least the settle wait, or after a settle wait at the
-// end. A failed read sends and stamps nothing for its chat, so a later pass
-// reads it again.
+// Detail mode: each chat read in turn, crawl_delay apart and never closer
+// than the settle wait, until the detail budget is spent. The floor keeps a
+// served crawl_delay of 0, or one that is not a number, from firing reads
+// back to back. A record's key is stamped after the wait before the next
+// read, or after a settle wait at the end. A failed read sends and stamps
+// nothing for its chat, so a later pass reads it again.
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
   const { client, framework } = deps;
@@ -227,7 +235,7 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       log('the detail budget is spent; the chats not read are read in a later pass');
       break;
     }
-    await deps.sleep(unstamped === null ? paceMs(framework) : Math.max(paceMs(framework), limits.settleMs));
+    await deps.sleep(Math.max(paceMs(framework), limits.settleMs));
     if (unstamped !== null) {
       const record: GeminiRecord = unstamped;
       unstamped = null;
