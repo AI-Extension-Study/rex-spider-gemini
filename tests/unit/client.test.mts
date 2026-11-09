@@ -101,3 +101,56 @@ test('a request that answered leaves no timer behind to abort its signal later',
   t.mock.timers.tick(REQUEST_TIMEOUT_MS);
   assert.equal((signal as AbortSignal | null)?.aborted, false, 'a timer aborted a request that had already answered');
 });
+
+test('a request makes a keep-alive call before it starts and after it ends', async () => {
+  const events: string[] = [];
+  const client = createClient({
+    keepAlive: () => {
+      events.push('keep-alive');
+    },
+    fetch: async () => {
+      events.push('fetch');
+      return new Response('ok');
+    },
+  });
+  await client.get('https://gemini.google.com/app');
+  assert.deepEqual(events, ['keep-alive', 'fetch', 'keep-alive']);
+});
+
+test('a keep-alive that throws does not break a request', async () => {
+  const lines: string[] = [];
+  const client = createClient({
+    keepAlive: () => {
+      throw new TypeError('no storage');
+    },
+    log: (line) => lines.push(line),
+    fetch: answering(() => new Response('ok')),
+  });
+  assert.deepEqual(await client.get('https://gemini.google.com/app'), { kind: 'ok', status: 200, text: 'ok' });
+  assert.deepEqual(lines, ['keep-alive failed (TypeError)', 'keep-alive failed (TypeError)']);
+});
+
+test('a body that fails while being read answers network', async () => {
+  const broken = new ReadableStream({
+    start(controller) {
+      controller.error(new TypeError('connection reset'));
+    },
+  });
+  const client = createClient({ fetch: answering(() => new Response(broken)) });
+  assert.deepEqual(await client.get('https://gemini.google.com/app'), { kind: 'network' });
+});
+
+test('without an injected fetch the client uses the global fetch', async () => {
+  const original = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = async (input) => {
+    calls.push(String(input));
+    return new Response('global');
+  };
+  try {
+    assert.deepEqual(await createClient().get('https://gemini.google.com/app'), { kind: 'ok', status: 200, text: 'global' });
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.deepEqual(calls, ['https://gemini.google.com/app']);
+});

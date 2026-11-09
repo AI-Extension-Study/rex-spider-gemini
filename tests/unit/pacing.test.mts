@@ -10,8 +10,12 @@ function recorder() {
     keepAlive: () => {
       events.push('keep-alive');
     },
+    // Throws once a sleep has gone on far longer than any test asks for, so a
+    // sleep that never ends fails the test instead of holding the runner: its
+    // waits resolve at once, and the loop would starve the runner's timers.
     wait: async (ms: number) => {
       events.push(`wait ${ms}`);
+      if (events.length > 100) throw new Error('sleep did not stop');
     },
   };
 }
@@ -66,8 +70,8 @@ test('a keep-alive that never answers does not hold the sleep', { timeout: 2000 
   assert.deepEqual(record.events, ['wait 10000']);
 });
 
-test('a sleep of zero, a negative or a non-number makes no call', async () => {
-  for (const ms of [0, -5, Number.NaN]) {
+test('a sleep of zero, a negative, a non-number or Infinity makes no call', async () => {
+  for (const ms of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
     const record = recorder();
     await sleep(ms, { keepAlive: record.keepAlive, wait: record.wait });
     assert.deepEqual(record.events, [], String(ms));

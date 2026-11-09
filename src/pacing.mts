@@ -14,8 +14,12 @@ export interface SleepOptions {
 
 const timer = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const nameOf = (error: unknown) => (error instanceof Error ? error.name : typeof error);
+const defaultLog = (line: string) => console.log(`[rex-spider-gemini] ${line}`);
 
-export async function sleep(ms: number, { keepAlive, wait = timer, log = (line) => console.log(`[rex-spider-gemini] ${line}`) }: SleepOptions): Promise<void> {
+// Makes the keep-alive call without waiting on it: the call resets the idle
+// timer when it is made, and one that never answers must hold nothing up. A
+// call that throws or rejects is logged by its error's name and ignored.
+export function touch(keepAlive: () => unknown, log: (line: string) => void = defaultLog): void {
   const failed = (error: unknown) => {
     try {
       log(`keep-alive failed (${nameOf(error)})`);
@@ -23,14 +27,21 @@ export async function sleep(ms: number, { keepAlive, wait = timer, log = (line) 
       // A log that throws has nowhere left to report to.
     }
   };
+  try {
+    Promise.resolve(keepAlive()).catch(failed);
+  } catch (error) {
+    failed(error);
+  }
+}
+
+export async function sleep(ms: number, { keepAlive, wait = timer, log = defaultLog }: SleepOptions): Promise<void> {
+  // A wait that is not a finite number is no wait, as a bare timer treated it,
+  // so a broken crawl_delay cannot hold a crawl for good.
+  if (!Number.isFinite(ms)) {
+    return;
+  }
   for (let left = ms; left > 0; left -= CHUNK_MS) {
-    // Not awaited: the call resets the idle timer when it is made, and one
-    // that never answers must not hold the wait.
-    try {
-      Promise.resolve(keepAlive()).catch(failed);
-    } catch (error) {
-      failed(error);
-    }
+    touch(keepAlive, log);
     await wait(Math.min(left, CHUNK_MS));
   }
 }

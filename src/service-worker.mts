@@ -15,14 +15,16 @@ const GEMINI_SPIDER_PAGE_SIZE = 10
 // worker awake through a wait (src/pacing.mts).
 const KEEP_ALIVE_KEY = 'rex-spider-gemini-keep-alive'
 
+const keepAlive = () => chrome.storage.local.get(KEEP_ALIVE_KEY)
+
 function pause(ms:number): Promise<void> {
-  return sleep(ms, { keepAlive: () => chrome.storage.local.get(KEEP_ALIVE_KEY) })
+  return sleep(ms, { keepAlive })
 }
 
 export class REXGeminiSpider extends REXSpider {
   accessToken:string|null = null
 
-  client:Client = createClient()
+  client:Client = createClient({ keepAlive })
 
   fetchUrls(): string[] {
     return []
@@ -105,7 +107,7 @@ export class REXGeminiSpider extends REXSpider {
           if (args !== undefined) {
             this.client.postForm(chatsUrl, batchBody(LIST_RPC, args, this.accessToken as string)).then((answer) => {
               if (answer.kind !== 'ok') {
-                reject(`Unable to crawl the conversation list (${answer.kind}).`)
+                reject(`Unable to crawl the conversation list (${answer.kind})`)
               } else if (answer.status < 200 || answer.status > 299) {
                 if (checkedRecords.length === 0) {
                   reject(`List fetch failed (status ${answer.status}).`)
@@ -202,11 +204,11 @@ export class REXGeminiSpider extends REXSpider {
                   checkNextConversation()
                 })
                 .catch((err) => {
-                  reject(`Unable to process the conversation list: ${err}.`)
+                  reject(`Unable to process the conversation list: ${err}`)
                 })
               }
             }).catch((err) => {
-              reject(`Unable to crawl the conversation list: ${err}.`)
+              reject(`Unable to crawl the conversation list: ${err}`)
             })
           } else {
             pause(this.fetchCrawlDelay()).then(fetchNext)

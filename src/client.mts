@@ -3,6 +3,8 @@
 // answers rather than rejecting, so a caller sorts every outcome in one place
 // and a request that never answers cannot hold a crawl, or the spider's
 // crawling flag, until the worker restarts.
+import { touch } from './pacing.mts';
+
 export type Answer =
   | { readonly kind: 'ok'; readonly status: number; readonly text: string }
   | { readonly kind: 'timeout' }
@@ -18,10 +20,20 @@ export const REQUEST_TIMEOUT_MS = 20_000;
 export interface ClientOptions {
   readonly fetch?: (url: string, init: RequestInit) => Promise<Response>;
   readonly timeoutMs?: number;
+  // Made before each request and after its answer, so a request never adds
+  // its own length to a stretch without an extension call (src/pacing.mts).
+  readonly keepAlive?: () => unknown;
+  readonly log?: (line: string) => void;
 }
 
-export function createClient({ fetch: send = (url, init) => fetch(url, init), timeoutMs = REQUEST_TIMEOUT_MS }: ClientOptions = {}): Client {
+export function createClient({ fetch: send = (url, init) => fetch(url, init), timeoutMs = REQUEST_TIMEOUT_MS, keepAlive, log }: ClientOptions = {}): Client {
+  const awake = () => {
+    if (keepAlive !== undefined) {
+      touch(keepAlive, log);
+    }
+  };
   async function request(url: string, init: RequestInit): Promise<Answer> {
+    awake();
     const controller = new AbortController();
     // Raced against the request and the body read, so the timeout holds even
     // where an abort does not reach them.
@@ -38,6 +50,7 @@ export function createClient({ fetch: send = (url, init) => fetch(url, init), ti
       return controller.signal.aborted ? { kind: 'timeout' } : { kind: 'network' };
     } finally {
       clearTimeout(timer);
+      awake();
     }
   }
   return {
