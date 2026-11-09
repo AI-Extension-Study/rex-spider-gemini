@@ -5,11 +5,9 @@ import { type EventPayload, dispatchEvent } from '@bric/rex-core/service-worker'
 import rexSpiderPlugin, { REXSpider, type REXSpiderCrawlResult, type REXSpiderCrawlInspection } from '@bric/rex-spider/service-worker'
 
 import { type Client, createClient } from './client.mts'
-import { LIST_RPC, parseListPage, toConversation } from './list.mts'
+import { toConversation } from './list.mts'
 import { sleep } from './pacing.mts'
-import { bardErrorCodes, batchBody, batchUrl } from './wire.mts'
-
-const GEMINI_SPIDER_PAGE_SIZE = 10
+import { walkList } from './walk.mts'
 
 // A key nothing stores. Reading it is the cheap extension call that keeps the
 // worker awake through a wait (src/pacing.mts).
@@ -80,144 +78,54 @@ export class REXGeminiSpider extends REXSpider {
     })
   }
 
-  fetchChats(): Promise<[REXSpiderCrawlInspection[], boolean]> {
-    return new Promise<[REXSpiderCrawlInspection[], boolean]>((resolve, reject) => {
-      const requestId = Math.floor(Math.random() * (999999 - 10000)) + 10000
-
-      const chatsUrl = batchUrl(LIST_RPC, requestId)
-
-      // The arguments of the list calls still to make, the last one first.
-      const pending:unknown[][] = [
-        [GEMINI_SPIDER_PAGE_SIZE, null, [0, null, 1]],
-        [GEMINI_SPIDER_PAGE_SIZE, null, [1, null, 1]]
-      ]
-
-      const checkedRecords:REXSpiderCrawlInspection[] = []
-
-      // Cleared by an answer the walk could not read in full, so the pass
-      // reports itself as partial even when every call was made.
-      let complete = true
-
-      const fetchNext = () => {
-        if (pending.length == 0) {
-          resolve([checkedRecords, complete])
-        } else {
-          const args = pending.pop()
-
-          if (args !== undefined) {
-            this.client.postForm(chatsUrl, batchBody(LIST_RPC, args, this.accessToken as string)).then((answer) => {
-              if (answer.kind !== 'ok') {
-                reject(`Unable to crawl the conversation list (${answer.kind})`)
-              } else if (answer.status < 200 || answer.status > 299) {
-                if (checkedRecords.length === 0) {
-                  reject(`List fetch failed (status ${answer.status})`)
-                } else {
-                  console.log(`[rex-spider-gemini] Error parsing conversation list. Transmitting gathered conversations. Status code: ${answer.status}`)
-                  resolve([checkedRecords, false])
-                }
-              } else {
-                Promise.resolve(answer.text).then((rawBody) => {
-                  if (bardErrorCodes(rawBody).includes(1096)) {
-                    console.log(`[rex-spider-gemini] Error parsing conversation list. Authorization has likely expired. (This will be fixed soon.)`)
-                    resolve([checkedRecords, false])
-
-                    return
-                  }
-
-                  const page = parseListPage(rawBody)
-
-                  if (page.kind === 'not-a-list') {
-                    reject(`Received invalid response for conversation API. Request: ${JSON.stringify(args)}`)
-
-                    return
-                  }
-
-                  // A failed list call is not an account without chats. The walk
-                  // goes on to the calls left, and the pass reports itself as
-                  // partial.
-                  if (page.kind === 'error') {
-                    console.log(`[rex-spider-gemini] A conversation list call answered with an error (code ${page.code}).`)
-
-                    complete = false
-
-                    pause(this.fetchCrawlDelay()).then(fetchNext)
-
-                    return
-                  }
-
-                  if (page.skipped > 0) {
-                    console.log(`[rex-spider-gemini] Skipped ${page.skipped} conversation list entries without an id or a time.`)
-
-                    complete = false
-                  }
-
-                  if (page.next !== null) {
-                    pending.push([args[0], page.next, args[2]])
-                  }
-
-                  const parsed:Conversation[] = page.items.map(toConversation)
-
-                  const checkNextConversation = () => {
-                    if (parsed.length === 0) {
-                      pause(this.fetchCrawlDelay()).then(fetchNext)
-                    } else {
-                      const nextConvo:Conversation | undefined = parsed.pop()
-
-                      if (nextConvo !== undefined && nextConvo.ended !== undefined) {
-                        try {
-                          this.crawlWindowContains(nextConvo.ended.timestamp()).then((include) => {
-                            if (include && nextConvo.ended !== undefined) {
-                              this.checkIfAlreadyTransmitted(nextConvo.identifier, nextConvo.ended).then((transmitted:boolean) => {
-                                if (nextConvo.ended !== undefined) {
-                                  if (transmitted) {
-                                    checkedRecords.push({
-                                      id: nextConvo.identifier,
-                                      refresh: false,
-                                      conversation: nextConvo,
-                                      lookupDate: nextConvo.ended
-                                    })
-                                  } else {
-                                    checkedRecords.push({
-                                      id: nextConvo.identifier,
-                                      refresh: true,
-                                      conversation: nextConvo,
-                                      lookupDate: nextConvo.ended
-                                    })
-                                  }
-                                }
-
-                                checkNextConversation()
-                              })
-                            } else {
-                              checkNextConversation()
-                            }
-                          })
-                        } catch (err) {
-                          reject(`Error encountered processing conversation: ${err}`)
-                        }
-                      } else {
-                        checkNextConversation()
-                      }
-                    }
-                  }
-
-                  checkNextConversation()
-                })
-                .catch((err) => {
-                  reject(`Unable to process the conversation list: ${err}`)
-                })
-              }
-            }).catch((err) => {
-              reject(`Unable to crawl the conversation list: ${err}`)
-            })
-          } else {
-            pause(this.fetchCrawlDelay()).then(fetchNext)
-          }
-        }
-      }
-
-      fetchNext()
+  async fetchChats(): Promise<[REXSpiderCrawlInspection[], boolean]> {
+    const walk = await walkList({
+      client: this.client,
+      sleep: pause,
+      crawlDelay: () => this.fetchCrawlDelay(),
+      at: this.accessToken as string,
+      requestId: Math.floor(Math.random() * (999999 - 10000)) + 10000
     })
+
+    // Each listed chat in the crawl window, and whether it went out before at
+    // this last-message time.
+    const inspected:REXSpiderCrawlInspection[] = []
+
+    for (const item of walk.items) {
+      const conversation = toConversation(item)
+      const ended = conversation.ended as DateString
+
+      if (await this.crawlWindowContains(ended.timestamp())) {
+        const transmitted = await this.checkIfAlreadyTransmitted(item.id, ended)
+
+        inspected.push({ id: item.id, refresh: !transmitted, conversation, lookupDate: ended })
+      }
+    }
+
+    const stop = walk.stop
+
+    if (stop === null) {
+      return [inspected, walk.complete]
+    }
+
+    switch (stop.kind) {
+      case 'expired':
+        console.log(`[rex-spider-gemini] Error parsing conversation list. Authorization has likely expired. (This will be fixed soon.)`)
+
+        return [inspected, false]
+      case 'http':
+        if (inspected.length === 0) {
+          throw `List fetch failed (status ${stop.status})`
+        }
+
+        console.log(`[rex-spider-gemini] Error parsing conversation list. Transmitting gathered conversations. Status code: ${stop.status}`)
+
+        return [inspected, false]
+      case 'not-a-list':
+        throw 'Received invalid response for conversation API'
+      default:
+        throw `Unable to crawl the conversation list (${stop.kind})`
+    }
   }
 
   doBackgroundCrawl():Promise<REXSpiderCrawlResult> {
