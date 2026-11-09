@@ -225,30 +225,33 @@ test('a pass never throws: a framework call that throws ends it with an error re
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [-1, 'Error encountered parsing conversations: internal error (TypeError).']);
 });
 
-test('enabled turning false stops the walk before its next list call, and nothing is sent', async () => {
+test('enabled turning false stops the walk before its next list call, sends nothing and reports no reading', async () => {
   let calls = 0;
   const fake = client({ other: listPage(entries(1)), main: listPage(entries(2)) });
   // Read once before the homepage, once before the first list call.
   const side = framework({ enabled: () => (calls += 1) <= 2 });
   const run = await pass(fake, side);
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length], [0, 'Crawl stopped: spider disabled.', 0]);
+  // -1, not 0: a count of 0 or more says crawledIds is a reading of the
+  // chats in the window, and an empty one would read as an emptied account.
+  assert.deepEqual(run.outcome, { crawledCount: -1, crawledIds: [], reason: 'Crawl stopped: spider disabled.', issue: null });
+  assert.equal(run.sent.length, 0);
   assert.equal(fake.calls.filter((call) => call.startsWith('list')).length, 1, 'a list call went out after the spider was switched off');
   assert.equal(side.counts.reads, 0, 'chats were checked after the spider was switched off');
 });
 
-test('enabled turning false stops sending before the next batch', async () => {
+test('enabled turning false stops sending before the next batch, and the list read stays reported', async () => {
   let checks = 0;
   // The homepage and the two list calls read enabled once each; the first
   // batch reads it fourth.
   const side = framework({ enabled: () => (checks += 1) <= 4 });
   const run = await pass(client({ main: listPage(entries(3)) }), side, { batch: 2 });
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.map((record) => record.identifier)], [2, 'Crawl stopped: spider disabled.', [chatId(3), chatId(2)]]);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.crawledIds, run.outcome.reason, run.sent.map((record) => record.identifier)], [2, [chatId(1), chatId(2), chatId(3)], 'Crawl stopped: spider disabled.', [chatId(3), chatId(2)]]);
 });
 
-test('a spider switched off before its pass begins makes no request at all', async () => {
+test('a spider switched off before its pass begins makes no request and reports no reading', async () => {
   const fake = client({ main: listPage(entries(1)) });
   const run = await pass(fake, framework({ enabled: () => false }));
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, fake.calls], [0, 'Crawl stopped: spider disabled.', []]);
+  assert.deepEqual([run.outcome, fake.calls], [{ crawledCount: -1, crawledIds: [], reason: 'Crawl stopped: spider disabled.', issue: null }, []]);
 });
 
 test('a switch-off during the wait between list calls stops the next call', async () => {
@@ -267,7 +270,7 @@ test('a switch-off during the wait between list calls stops the next call', asyn
     limits: { settleMs: 1500, batch: 25, storeMs: 20 },
     log: () => {},
   });
-  assert.equal(outcome.reason, 'Crawl stopped: spider disabled.');
+  assert.deepEqual([outcome.crawledCount, outcome.reason], [-1, 'Crawl stopped: spider disabled.']);
   assert.equal(fake.calls.filter((call) => call.startsWith('list')).length, 1, 'the call after the wait went out with the config read before it');
 });
 

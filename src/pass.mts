@@ -58,7 +58,10 @@ export interface PassDeps {
 }
 
 export interface PassOutcome {
-  // Records sent, or -1 when the pass ended in an error.
+  // Records sent, or -1 when the pass has no reading of the list: it ended in
+  // an error, or was switched off before the list was read. Readers of the
+  // completion event take a count of 0 or more to mean crawledIds is such a
+  // reading, so an empty list there would read as an emptied account.
   readonly crawledCount: number;
   // The chats in the crawl window that were checked.
   readonly crawledIds: string[];
@@ -69,6 +72,9 @@ export interface PassOutcome {
 
 // An error sends nothing: every error stop comes before any chat was checked.
 const failed = (reason: string, issue: string = reason): PassOutcome => ({ crawledCount: -1, crawledIds: [], reason, issue });
+
+// A switch-off before the list was read: no reading, and not an issue.
+const SWITCHED_OFF: PassOutcome = { crawledCount: -1, crawledIds: [], reason: DISABLED, issue: null };
 
 class StoreSilent extends Error {}
 
@@ -109,7 +115,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     // rex-spider checks enabled when it queues the crawl; the served config
     // may have switched the spider off while other spiders ran first.
     if (!framework.isEnabled()) {
-      return { crawledCount: 0, crawledIds: [], reason: DISABLED, issue: null };
+      return SWITCHED_OFF;
     }
     const home = await client.get(HOME_URL);
     if (home.kind !== 'ok') {
@@ -143,7 +149,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (walk.stop !== null) {
       const reason = stopReason(walk.stop, crawledIds.length);
       if (reason === DISABLED) {
-        return { crawledCount: 0, crawledIds: [], reason, issue: null };
+        return SWITCHED_OFF;
       }
       if (reason !== null) {
         return failed(reason);
