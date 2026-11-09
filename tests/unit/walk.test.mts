@@ -189,14 +189,54 @@ test('an empty page that carries a new cursor is followed', async () => {
   assert.equal(result.complete, true);
 });
 
-test('each list keeps its own seen chats and cursors, so the main list is not cut for repeating the other', async () => {
+test('each list keeps its own cursors, so the main list may use one the other gave', async () => {
   const run = walk({
     [key(OTHER, null)]: page([entry(1)], 'X'),
     [key(OTHER, 'X')]: page([entry(2)]),
-    [key(MAIN, null)]: page([entry(1), entry(2)], 'X'),
-    [key(MAIN, 'X')]: page([entry(3)]),
+    [key(MAIN, null)]: page([entry(3)], 'X'),
+    [key(MAIN, 'X')]: page([entry(4)]),
   });
   const result = await run.result;
   assert.deepEqual(run.calls, [[10, null, OTHER], [10, 'X', OTHER], [10, null, MAIN], [10, 'X', MAIN]]);
-  assert.deepEqual({ ids: ids(result.items), complete: result.complete }, { ids: [chatId(1), chatId(2), chatId(3)], complete: true });
+  assert.deepEqual({ ids: ids(result.items), complete: result.complete }, { ids: [chatId(1), chatId(2), chatId(3), chatId(4)], complete: true });
+});
+
+test('each list keeps its own seen chats, so the main list repeating the other\'s chats is not stuck', async () => {
+  const run = walk({
+    [key(OTHER, null)]: page([entry(1)], 'B2'),
+    [key(OTHER, 'B2')]: page([entry(2)], 'B3'),
+    [key(OTHER, 'B3')]: page([entry(3)]),
+    [key(MAIN, null)]: page([entry(1)], 'A2'),
+    [key(MAIN, 'A2')]: page([entry(2)], 'A3'),
+    [key(MAIN, 'A3')]: page([entry(3)], 'A4'),
+    [key(MAIN, 'A4')]: page([entry(4)]),
+  });
+  const result = await run.result;
+  assert.deepEqual(run.calls.slice(3), [[10, null, MAIN], [10, 'A2', MAIN], [10, 'A3', MAIN], [10, 'A4', MAIN]]);
+  assert.equal(result.complete, true);
+});
+
+test('each list counts its own pages with nothing new, so the main list starts afresh', async () => {
+  const run = walk({
+    [key(OTHER, null)]: page([entry(1)], 'B2'),
+    [key(OTHER, 'B2')]: page([entry(1)], 'B3'),
+    [key(OTHER, 'B3')]: page([entry(1)]),
+    [key(MAIN, null)]: page([], 'A2'),
+    [key(MAIN, 'A2')]: page([entry(2)]),
+  });
+  const result = await run.result;
+  assert.deepEqual(run.calls.slice(3), [[10, null, MAIN], [10, 'A2', MAIN]]);
+  assert.equal(result.complete, true);
+});
+
+test('a cursor that comes back after a different one ends that list', async () => {
+  const run = walk({
+    [key(OTHER, null)]: page([entry(1)], 'A'),
+    [key(OTHER, 'A')]: page([entry(2)], 'B'),
+    [key(OTHER, 'B')]: page([entry(3)], 'A'),
+    [key(MAIN, null)]: page([]),
+  });
+  const result = await run.result;
+  assert.deepEqual(run.calls, [[10, null, OTHER], [10, 'A', OTHER], [10, 'B', OTHER], [10, null, MAIN]]);
+  assert.equal(result.complete, false);
 });
