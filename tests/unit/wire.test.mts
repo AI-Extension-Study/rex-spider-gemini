@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { bardErrorCodes, batchBody, batchUrl, rpcFrames } from '../../src/wire.mts';
+import { bardErrorCodes, batchBody, batchUrl, pageToken, rpcFrames } from '../../src/wire.mts';
 import { batchResponse, wrb, wrbError } from './batch.mts';
 
 test('batchUrl builds the query the spider sends', () => {
@@ -44,4 +44,11 @@ test('bardErrorCodes reads every BardErrorInfo code in order, and none without o
   const body = `)]}'\n\n120\n[["wrb.fr","MaZiqc",null,null,null,[16],"generic",${info(7)}],["wrb.fr","MaZiqc",null,null,null,[16],"generic",${info(1096)}]]\n`;
   assert.deepEqual(bardErrorCodes(body), [7, 1096]);
   assert.deepEqual(bardErrorCodes(batchResponse(wrb('MaZiqc', [null, null, []]))), []);
+});
+
+test('pageToken reads the SNlM0e value from the homepage, and is null without one', () => {
+  assert.equal(pageToken('<script>WIZ_global_data = {"FdrFJe":"1","SNlM0e":"AbCd-123:1700000000000","x":2};</script>'), 'AbCd-123:1700000000000');
+  for (const html of ['<html>Sign in</html>', '{"SNlM0e":""}', '{"SNlM0e":', '{"SNlM0e":"no-closing-quote', '']) {
+    assert.equal(pageToken(html), null, JSON.stringify(html));
+  }
 });

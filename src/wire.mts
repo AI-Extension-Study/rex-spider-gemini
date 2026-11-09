@@ -75,3 +75,16 @@ const BARD_ERROR = /"type\.googleapis\.com\/assistant\.boq\.bard\.application\.B
 export function bardErrorCodes(body: string): number[] {
   return typeof body === 'string' ? [...body.matchAll(BARD_ERROR)].map((match) => Number(match[1])) : [];
 }
+
+// The page token batchexecute calls carry as `at`: the SNlM0e value the
+// homepage embeds. Null when the page has none, as a signed-out page does.
+export function pageToken(html: string): string | null {
+  const marker = '"SNlM0e":"';
+  const start = typeof html === 'string' ? html.indexOf(marker) : -1;
+  if (start === -1) {
+    return null;
+  }
+  const end = html.indexOf('"', start + marker.length);
+  const token = end === -1 ? '' : html.slice(start + marker.length, end);
+  return token === '' ? null : token;
+}

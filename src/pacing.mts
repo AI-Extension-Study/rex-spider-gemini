@@ -48,3 +48,21 @@ export async function sleep(ms: number, { keepAlive, wait = timer, log = default
     await wait(Math.min(left, CHUNK_MS));
   }
 }
+
+// What withDeadline answers when the deadline comes first.
+export const TIMED_OUT = Symbol('timed out');
+
+// A race for a promise that is not a request (the client aborts its own): it
+// ends the wait and cancels nothing, so whatever the promise goes on to do is
+// ignored, and a rejection that comes after the deadline goes nowhere.
+export async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}

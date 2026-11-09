@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { CHUNK_MS, sleep } from '../../src/pacing.mts';
+import { CHUNK_MS, TIMED_OUT, sleep, withDeadline } from '../../src/pacing.mts';
 
 function recorder() {
   const events: string[] = [];
@@ -88,4 +88,25 @@ test('without an injected wait, sleep waits on a real timer', async () => {
   const started = performance.now();
   await sleep(30, { keepAlive: () => undefined });
   assert.ok(performance.now() - started >= 25, 'returned before the timer');
+});
+
+test('withDeadline answers the promise\'s value when it comes first, and TIMED_OUT when the deadline does', { timeout: 2000 }, async () => {
+  assert.equal(await withDeadline(Promise.resolve('value'), 1000), 'value');
+  assert.equal(await withDeadline(new Promise(() => {}), 20), TIMED_OUT);
+});
+
+test('withDeadline passes a rejection through, and a rejection after the deadline goes nowhere', { timeout: 2000 }, async () => {
+  await assert.rejects(withDeadline(Promise.reject(new TypeError('broken')), 1000), TypeError);
+  let reject: (error: Error) => void = () => {};
+  const late = new Promise((_resolve, rejectLater) => { reject = rejectLater; });
+  assert.equal(await withDeadline(late, 10), TIMED_OUT);
+  reject(new Error('after the deadline'));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+});
+
+test('withDeadline leaves no timer behind once the promise has answered', async () => {
+  const timers = () => process.getActiveResourcesInfo().filter((kind) => kind === 'Timeout').length;
+  const before = timers();
+  await withDeadline(Promise.resolve('value'), 60_000);
+  assert.equal(timers(), before, 'a deadline timer is still running after the race');
 });
