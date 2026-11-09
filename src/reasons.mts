@@ -9,3 +9,5 @@ export const NO_TOKEN = 'No access token found on homepage.';
 export const homepageFailed = (status: number) => `Homepage fetch failed (status ${status}).`;
 export const homepageUnreachable = (kind: 'timeout' | 'network') => `Error encountered fetching network resource: ${kind}.`;
 export const listFailed = (what: string) => `Error encountered parsing conversations: ${what}.`;
+export const STORE_SILENT = 'Crawl stopped: the extension storage did not answer.';
+export const DISABLED = 'Crawl stopped: spider disabled.';

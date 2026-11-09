@@ -25,7 +25,9 @@ export type WalkStop =
   | { readonly kind: 'http'; readonly status: number }
   | { readonly kind: 'timeout' }
   | { readonly kind: 'network' }
-  | { readonly kind: 'expired' };
+  | { readonly kind: 'expired' }
+  // The served config switched the spider off during the walk.
+  | { readonly kind: 'disabled' };
 
 export interface WalkResult {
   // Each chat once, in the order first listed. A chat both lists give
@@ -46,12 +48,14 @@ export interface WalkDeps {
   readonly at: string;
   readonly requestId: number;
   readonly maxPages?: number;
+  // Read before each list call; false stops the walk there.
+  readonly enabled?: () => boolean;
   readonly log?: (line: string) => void;
 }
 
 const defaultLog = (line: string) => console.log(`[rex-spider-gemini] ${line}`);
 
-export async function walkList({ client, sleep, crawlDelay, at, requestId, maxPages = MAX_PAGES, log = defaultLog }: WalkDeps): Promise<WalkResult> {
+export async function walkList({ client, sleep, crawlDelay, at, requestId, maxPages = MAX_PAGES, enabled = () => true, log = defaultLog }: WalkDeps): Promise<WalkResult> {
   const url = batchUrl(LIST_RPC, requestId);
   const items = new Map<string, ListItem>();
   let complete = true;
@@ -65,6 +69,9 @@ export async function walkList({ client, sleep, crawlDelay, at, requestId, maxPa
     for (let pages = 1; ; pages += 1) {
       if (calls > 0) {
         await sleep(crawlDelay());
+      }
+      if (!enabled()) {
+        return result({ kind: 'disabled' });
       }
       calls += 1;
       const answer = await client.postForm(url, batchBody(LIST_RPC, [PAGE_SIZE, cursor, variant], at));

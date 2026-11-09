@@ -33,12 +33,13 @@ function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Rec
 
 // rex-spider's side as the pass sees it: the crawl window, and the upload keys
 // a browser holds, keyed as rex-spider keys them (id and ended in ms).
-function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false } = {}) {
+function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, enabled = (): boolean => true } = {}) {
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stamped: string[] = [];
   const events: string[] = [];
   const counts = { reads: 0, stampTries: 0 };
   const fw: PassFramework = {
+    isEnabled: enabled,
     crawlWindowContains: async (ms) => ms >= windowStart,
     checkIfAlreadyTransmitted: (id: string, ended: DateString) => {
       counts.reads += 1;
@@ -85,9 +86,11 @@ const T = 1700000000;
 const entries = (n: number) => Array.from({ length: n }, (_, i) => listEntry(i + 1, T + i));
 
 test('a complete pass sends a summary record for each unsent chat in the window, newest first, and says Fetch successful.', async () => {
-  const run = await pass(client({ main: listPage(entries(3)) }), framework());
+  // Listed in an order that is neither newest nor oldest first.
+  const listed = [listEntry(1, T + 1), listEntry(3, T + 3), listEntry(2, T + 2)];
+  const run = await pass(client({ main: listPage(listed) }), framework());
   assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary]), [[chatId(3), true], [chatId(2), true], [chatId(1), true]]);
-  assert.deepEqual(run.outcome, { crawledCount: 3, crawledIds: [chatId(1), chatId(2), chatId(3)], reason: 'Fetch successful.', issue: null });
+  assert.deepEqual(run.outcome, { crawledCount: 3, crawledIds: [chatId(1), chatId(3), chatId(2)], reason: 'Fetch successful.', issue: null });
 });
 
 test('after an update, chats the old build sent, keyed by the bare chat id, are not sent again', async () => {
@@ -169,15 +172,16 @@ test('a list error frame sends what was listed and reports partial', async () =>
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [2, 'Full fetch unsuccessful. Partial results returned.']);
 });
 
-test('a key read that gets no answer ends the pass with an error before anything is sent', { timeout: 2000 }, async () => {
+test('a key read that gets no answer ends the pass before anything is sent, with its own reason', { timeout: 2000 }, async () => {
   const run = await pass(client({ main: listPage(entries(3)) }), framework({ silentReads: true }));
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length], [-1, 'Error encountered parsing conversations: the store did not answer.', 0]);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length], [-1, 'Crawl stopped: the extension storage did not answer.', 0]);
 });
 
-test('a stamp that gets no answer stops the stamping, and the pass reports partial', { timeout: 2000 }, async () => {
+test('a stamp that gets no answer stops stamping and sending for the pass, which still says the list was read in full', { timeout: 2000 }, async () => {
   const side = framework({ silentStamps: true });
-  const run = await pass(client({ main: listPage(entries(3)) }), side);
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, side.counts.stampTries], [3, 'Full fetch unsuccessful. Partial results returned.', 1]);
+  const run = await pass(client({ main: listPage(entries(3)) }), side, { batch: 2 });
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, side.counts.stampTries, run.sent.map((record) => record.identifier)],
+    [2, 'Fetch successful.', 1, [chatId(3), chatId(2)]]);
 });
 
 test('a long check of the listed chats makes a keep-alive call every 100 chats', async () => {
@@ -204,7 +208,8 @@ test('a dispatch that throws is logged, its key is not stamped, and the pass goe
     limits: { settleMs: 1500, batch: 25, storeMs: 20 },
     log: () => {},
   });
-  assert.deepEqual([outcome.crawledCount, side.stamped.length], [1, 1]);
+  // The newest record's dispatch threw; only the other was sent and stamped.
+  assert.deepEqual([outcome.crawledCount, side.stamped], [1, [`${chatId(1)} ${T * 1000}`]]);
 });
 
 test('a pass never throws: a framework call that throws ends it with an error reason naming only the error\'s kind', async () => {
@@ -214,4 +219,21 @@ test('a pass never throws: a framework call that throws ends it with an error re
   };
   const run = await pass(client({ main: listPage(entries(1)) }), side);
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [-1, 'Error encountered parsing conversations: internal error (TypeError).']);
+});
+
+test('enabled turning false stops the walk before its next list call, and nothing is sent', async () => {
+  let calls = 0;
+  const fake = client({ other: listPage(entries(1)), main: listPage(entries(2)) });
+  const side = framework({ enabled: () => (calls += 1) <= 1 });
+  const run = await pass(fake, side);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length], [0, 'Crawl stopped: spider disabled.', 0]);
+  assert.equal(fake.calls.filter((call) => call.startsWith('list')).length, 1, 'a list call went out after the spider was switched off');
+});
+
+test('enabled turning false stops sending before the next batch', async () => {
+  let checks = 0;
+  // Two list calls read enabled once each; the first batch reads it third.
+  const side = framework({ enabled: () => (checks += 1) <= 3 });
+  const run = await pass(client({ main: listPage(entries(3)) }), side, { batch: 2 });
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.map((record) => record.identifier)], [2, 'Crawl stopped: spider disabled.', [chatId(3), chatId(2)]]);
 });

@@ -8,16 +8,19 @@ import type { DateString } from '@bric/rex-types/types';
 import { type Client } from './client.mts';
 import { uploadKeyId } from './keys.mts';
 import { TIMED_OUT, withDeadline } from './pacing.mts';
-import { FETCH_SUCCESSFUL, NO_TOKEN, PARTIAL, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
+import { DISABLED, FETCH_SUCCESSFUL, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
 import { type GeminiRecord, buildSummaryRecord } from './record.mts';
 import { type WalkStop, walkList } from './walk.mts';
 import { pageToken } from './wire.mts';
 
 export const HOME_URL = 'https://gemini.google.com/app';
 
-// The rex-spider calls the pass makes. Each goes to rex-core's store, which
-// never answers while its database is not open, so each runs to a deadline.
+// The rex-spider calls the pass makes. The window check reads the extension's
+// storage and the key calls rex-core's store, which never answers while its
+// database is not open, so each runs to a deadline. isEnabled is the served
+// config as of now, read before each request and each batch.
 export interface PassFramework {
+  isEnabled(): boolean;
   crawlWindowContains(timestamp: number): Promise<boolean>;
   checkIfAlreadyTransmitted(identifier: string, updated: DateString): Promise<boolean>;
   logTransmitted(identifier: string, updated: DateString): Promise<void>;
@@ -25,16 +28,23 @@ export interface PassFramework {
 }
 
 export interface PassLimits {
-  // The wait after a batch of dispatches before their keys are stamped, so
-  // the records are stored first: a worker that dies in between sends them
-  // again, never loses them.
+  // The wait after a batch of dispatches before their keys are stamped. It
+  // stands in for a signal rex-core's dispatchEvent does not give: when a
+  // point is stored. The extension that bundles this module stores points a
+  // little over a second after the last one (a trailing timer of 1.1 s, then
+  // one write per point), so 3 s leaves room for 25 records. A worker that
+  // dies before the stamps sends those records again rather than losing
+  // them. A point the extension drops before storing it (its processing has
+  // no error path) is lost all the same, and this module cannot see that.
   readonly settleMs: number;
   readonly batch: number;
-  // The longest wait for one store call.
+  // The longest wait for one window check, key read or stamp. Long enough
+  // that only storage that is not answering trips it, as the other REX
+  // spiders' passes allow.
   readonly storeMs: number;
 }
 
-export const PASS_LIMITS: PassLimits = { settleMs: 1500, batch: 25, storeMs: 1000 };
+export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000 };
 
 // A keep-alive call every this many chats in a loop that makes no request:
 // store reads do not reset the worker's idle timer.
@@ -88,6 +98,8 @@ function stopReason(stop: WalkStop, inWindow: number): string | null {
       return inWindow === 0 ? listFailed(`List fetch failed (status ${stop.status})`) : null;
     case 'expired':
       return null;
+    case 'disabled':
+      return DISABLED;
   }
 }
 
@@ -106,11 +118,11 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
       return failed(NO_TOKEN);
     }
 
-    const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at, requestId: deps.requestId, log });
+    const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at, requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
 
     const crawledIds: string[] = [];
     const unsent: GeminiRecord[] = [];
-    const stopsBeforeSending = walk.stop !== null && ['not-a-list', 'timeout', 'network'].includes(walk.stop.kind);
+    const stopsBeforeSending = walk.stop !== null && ['not-a-list', 'timeout', 'network', 'disabled'].includes(walk.stop.kind);
     if (!stopsBeforeSending) {
       for (const [index, item] of walk.items.entries()) {
         if (index > 0 && index % KEEP_ALIVE_EVERY === 0) {
@@ -128,6 +140,9 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     }
     if (walk.stop !== null) {
       const reason = stopReason(walk.stop, crawledIds.length);
+      if (reason === DISABLED) {
+        return { crawledCount: 0, crawledIds: [], reason, issue: null };
+      }
       if (reason !== null) {
         return failed(reason);
       }
@@ -137,7 +152,12 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     unsent.sort((a, b) => b.ended.timestamp() - a.ended.timestamp());
     let sent = 0;
     let stampsStopped = false;
-    for (let start = 0; start < unsent.length; start += limits.batch) {
+    let disabled = false;
+    for (let start = 0; start < unsent.length && !stampsStopped; start += limits.batch) {
+      if (!framework.isEnabled()) {
+        disabled = true;
+        break;
+      }
       const batch: GeminiRecord[] = [];
       for (const record of unsent.slice(start, start + limits.batch)) {
         try {
@@ -153,19 +173,28 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
         if (stampsStopped) {
           break;
         }
-        const stamped = await withDeadline(framework.logTransmitted(uploadKeyId(record.identifier, true), record.ended), limits.storeMs);
+        const stamped = await withDeadline(Promise.resolve().then(() => framework.logTransmitted(uploadKeyId(record.identifier, true), record.ended)), limits.storeMs);
         if (stamped === TIMED_OUT) {
-          log('the store did not answer a stamp; the rest go out again next pass');
+          // Records sent from here on could not be stamped either, so none
+          // are: they go out next pass instead of twice.
+          log('the store did not answer a stamp; sending stops for this pass');
           stampsStopped = true;
         }
       }
     }
-    const complete = walk.complete && !stampsStopped;
-    return { crawledCount: sent, crawledIds, reason: complete ? FETCH_SUCCESSFUL : PARTIAL, issue: null };
+    // The reason says how the list was read; how much went out is the count.
+    // A pass that read the whole list says "Fetch successful." even when its
+    // sending stopped early: what it did not send goes out next pass.
+    if (disabled) {
+      return { crawledCount: sent, crawledIds, reason: DISABLED, issue: null };
+    }
+    return { crawledCount: sent, crawledIds, reason: walk.complete ? FETCH_SUCCESSFUL : PARTIAL, issue: null };
   } catch (error) {
     if (error instanceof StoreSilent) {
-      return failed(listFailed('the store did not answer'));
+      return failed(STORE_SILENT);
     }
-    return failed(listFailed(`internal error (${error instanceof Error ? error.name : typeof error})`));
+    const kind = error instanceof Error ? error.name : typeof error;
+    log(`the pass ended on an internal error (${kind})`);
+    return failed(listFailed(`internal error (${kind})`));
   }
 }
