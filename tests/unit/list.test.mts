@@ -29,6 +29,19 @@ test('the next-page token is payload[1] when it is a non-empty string', () => {
   }
 });
 
+test('a token in a payload without the entry slot is not followed', () => {
+  assert.deepEqual(parseListPage(batchResponse(wrb('MaZiqc', [null, 'NEXT-PAGE']))), { kind: 'page', items: [], next: null, skipped: 0 });
+});
+
+test('an entry whose time JSON.parse reads as Infinity is skipped and counted', () => {
+  // Written into the payload string by hand: JSON.stringify turns Infinity
+  // and NaN into null, so only a raw number too large for a double reaches
+  // the parser as a non-finite time.
+  const payload = `[null,null,[${JSON.stringify(listEntry(1, 1700000000))},["${chatId(2)}","Title",null,null,null,[1e999,0]]]]`;
+  const page = parseListPage(batchResponse(['wrb.fr', 'MaZiqc', payload, null, null, null, 'generic']));
+  assert.equal(page.kind === 'page' ? `${page.items.map((item) => item.id).join()} skipped ${page.skipped}` : page.kind, 'c_0000000000000001 skipped 1');
+});
+
 test('an entry without a string id or a numeric time at [5][0] is skipped and counted', () => {
   const good = listEntry(1, 1700000000);
   const entries = [
@@ -36,14 +49,13 @@ test('an entry without a string id or a numeric time at [5][0] is skipped and co
     [null, 'Title', null, null, null, [1700000000, 0]],
     [chatId(3), 'Title', null, null, null, null],
     [chatId(4), 'Title', null, null, null, ['1700000000', 0]],
-    [chatId(5), 'Title', null, null, null, [Number.NaN, 0]],
     'not an entry',
   ];
   assert.deepEqual(parseListPage(batchResponse(wrb('MaZiqc', [null, null, entries]))), {
     kind: 'page',
     items: [{ id: 'c_0000000000000001', endedSec: 1700000000, entry: good }],
     next: null,
-    skipped: 5,
+    skipped: 4,
   });
 });
 
@@ -67,7 +79,7 @@ test('an entry slot that holds something other than an array or null is an error
   }
 });
 
-test('a list item becomes the record fields the spider sends, keyed as earlier builds keyed it', () => {
+test('a list item becomes the record fields the spider sends, with the upload-key inputs earlier builds used', () => {
   const entry = listEntry(1, 1700000000);
   const conversation = toConversation({ id: chatId(1), endedSec: 1700000000, entry });
   assert.ok(conversation.ended instanceof DateString);
