@@ -21,6 +21,13 @@ function batch(rpcid: string, payload: unknown): string {
   return `)]}'\n\n${chunk.length}\n${chunk}\n`
 }
 
+// A failed call: no payload, the status in slot 5, as a read of a chat that
+// is not there answers.
+function batchError(rpcid: string, code: number): string {
+  const chunk = JSON.stringify([['wrb.fr', rpcid, null, null, null, [code], 'generic']])
+  return `)]}'\n\n${chunk.length}\n${chunk}\n`
+}
+
 // The requests one crawl makes, as answerGemini writes them down. A list
 // call shows its whole argument list: page size, cursor and variant.
 const LIST_CALL = (args: string) => `POST /_/BardChatUi/data/batchexecute MaZiqc ${args} at=TEST-TOKEN:1`
@@ -33,8 +40,9 @@ const READ_CALL = (n: number) => `POST /_/BardChatUi/data/batchexecute hNvQHb ${
 // keeps each request: its URL, and a line saying what it was. Anything else,
 // such as a call without this page's token, gets a 404, and its line shows
 // what was wrong. The main list is read at each call, so a test can add to
-// it. beforeMain, if given, is awaited before the main list is answered.
-async function answerGemini(context, mainList: unknown[][], { homeStatus = 200, beforeMain = async () => {} } = {}) {
+// it. beforeMain, if given, is awaited before the main list is answered; the
+// reads of the chats in failReads answer with an error frame.
+async function answerGemini(context, mainList: unknown[][], { homeStatus = 200, beforeMain = async () => {}, failReads = [] as number[] } = {}) {
   const urls: string[] = []
   const calls: string[] = []
   await context.route('https://gemini.google.com/**', async (route) => {
@@ -58,7 +66,8 @@ async function answerGemini(context, mainList: unknown[][], { homeStatus = 200, 
     const listed = mainList.find((listedEntry) => call === READ_CALL(Number.parseInt(String(listedEntry[0]).slice(2), 16)))
     if (listed !== undefined) {
       const n = Number.parseInt(String(listed[0]).slice(2), 16)
-      await route.fulfill({ status: 200, contentType: 'application/json', body: batch('hNvQHb', read(n, (listed[5] as number[])[0])) })
+      const body = failReads.includes(n) ? batchError('hNvQHb', 5) : batch('hNvQHb', read(n, (listed[5] as number[])[0]))
+      await route.fulfill({ status: 200, contentType: 'application/json', body })
       return
     }
     if (call !== OTHER_LIST && call !== MAIN_LIST) {
@@ -296,4 +305,32 @@ test('a round that starts while the spider is still crawling skips it', async ({
   expect(traffic.calls).toEqual(ONE_CRAWL)
   const events = await serviceWorker.evaluate(() => self.eventRecorder.events)
   expect(completions(events)).toEqual([[-1, [], '[gemini] Still crawling.'], [1, [chat(1)], 'Fetch successful.']])
+})
+
+// The served configs say halt_on_error false; rex-spider's default is true,
+// and its own flag, once false, never turns true again.
+test('a failed read goes out as a summary and its memo holds the chat back, and a refresh without halt_on_error stops the reads at the next failure', async ({ context, serviceWorker }) => {
+  test.setTimeout(60_000)
+  const listed = [entry(1, T), entry(2, T + 60)]
+  const traffic = await answerGemini(context, listed, { failReads: [2, 3] })
+  await untilStoreOpen(serviceWorker)
+  await configure(serviceWorker, { halt_on_error: false })
+
+  const first = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual([...ONE_CRAWL, READ_CALL(2), READ_CALL(1)])
+  expect(records(first.events)).toEqual([summary(2, T + 60, iso(T + 60)), detail(1, T)])
+  expect(completions(first.events)).toEqual([[2, [chat(1), chat(2)], 'Fetch successful.']])
+
+  const second = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual(ONE_CRAWL)
+  expect(records(second.events)).toEqual([])
+
+  // A new chat whose read fails, and an older one after it.
+  listed.push(entry(3, T + 120), entry(4, T + 30))
+  await configure(serviceWorker)
+  const third = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual([...ONE_CRAWL, READ_CALL(3)])
+  expect(records(third.events)).toEqual([summary(3, T + 120, iso(T + 120))])
+  expect(completions(third.events)).toEqual([[1, [chat(1), chat(2), chat(3), chat(4)], 'Crawl stopped: detail reads failed.']])
+  expect(third.result.issues).toEqual([{ url: HOME, message: 'Crawl stopped: detail reads failed.' }])
 })

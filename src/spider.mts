@@ -28,16 +28,26 @@ export class REXGeminiSpider extends REXSpider {
   // would not take.
   summarizes = false;
 
+  // halt_on_error as served on the last config refresh: true, rex-spider's
+  // default, ends a pass's detail reads at the first failed one. rex-spider's
+  // own flag only ever turns off.
+  haltsOnError = true;
+
   // rex-spider calls this on each refresh whose config has a block for this
   // spider or a default one. With neither, the mode last served stays until
   // the worker restarts, as enabled does.
   updateConfiguration(configuration: Parameters<REXSpider['updateConfiguration']>[0]): void {
     super.updateConfiguration(configuration);
     this.summarizes = configuration.summarize === true;
+    this.haltsOnError = configuration.halt_on_error !== false;
   }
 
   justSummarize(): boolean {
     return this.summarizes;
+  }
+
+  continueAfterError(): boolean {
+    return !this.haltsOnError;
   }
 
   fetchUrls(): string[] {
