@@ -11,6 +11,9 @@ import { batchResponse, chatId, listEntry, wrb, wrbError } from './batch.mts';
 const HOMEPAGE: Answer = { kind: 'ok', status: 200, text: '<script>WIZ_global_data = {"SNlM0e":"PAGE-TOKEN:1"};</script>' };
 const listPage = (entries: unknown[][], next: string | null = null): Answer => ({ kind: 'ok', status: 200, text: batchResponse(wrb('MaZiqc', [null, next, entries])) });
 const EMPTY = listPage([]);
+// A list call answered with the BardErrorInfo an expired session gets.
+const EXPIRED: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wrb.fr","MaZiqc",null,null,null,[16],"generic",[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1096]]]]]\n` };
+const ERROR_FRAME: Answer = { kind: 'ok', status: 200, text: batchResponse(wrbError('MaZiqc', 3)) };
 
 // The spider's two list calls answered by variant: [1,null,1] first, then the
 // main list [0,null,1], each a single page unless a cursor is scripted.
@@ -163,16 +166,45 @@ test('a list answer that is not a list, or a list call that fails, ends the pass
 });
 
 test('an HTTP error after chats in the window were listed, or an expired session, sends them and reports partial', async () => {
-  const expired: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wrb.fr","MaZiqc",null,null,null,[16],"generic",[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1096]]]]]\n` };
-  for (const answer of [{ kind: 'ok', status: 500, text: '' } as Answer, expired]) {
+  for (const answer of [{ kind: 'ok', status: 500, text: '' } as Answer, EXPIRED]) {
     const run = await pass(client({ other: listPage(entries(2)), main: answer }), framework());
     assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [2, 'Full fetch unsuccessful. Partial results returned.', null]);
   }
 });
 
 test('a list error frame sends what was listed and reports partial', async () => {
-  const run = await pass(client({ other: { kind: 'ok', status: 200, text: batchResponse(wrbError('MaZiqc', 3)) }, main: listPage(entries(2)) }), framework());
+  const run = await pass(client({ other: ERROR_FRAME, main: listPage(entries(2)) }), framework());
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [2, 'Full fetch unsuccessful. Partial results returned.']);
+});
+
+// A count of 0 or more says crawledIds is a reading of the chats in the
+// window; from a list read only in part, an empty one would look like an
+// emptied account.
+test('an expired session before any chat in the window was listed reports no reading', async () => {
+  const reason = 'Error encountered parsing conversations: Session expired.';
+  for (const [what, fake, side] of [
+    ['at the first list call', client({ other: EXPIRED, main: listPage(entries(2)) }), framework()],
+    ['after chats outside the window', client({ other: listPage(entries(2)), main: EXPIRED }), framework({ windowStart: Number.MAX_SAFE_INTEGER })],
+  ] as const) {
+    const run = await pass(fake, side);
+    assert.deepEqual(run.outcome, { crawledCount: -1, crawledIds: [], reason, issue: reason }, what);
+  }
+});
+
+test('a list read only in part that gave no chat in the window reports no reading', async () => {
+  const reason = 'Full fetch unsuccessful. No results returned.';
+  for (const [what, fake, side] of [
+    ['both lists answer an error frame', client({ other: ERROR_FRAME, main: ERROR_FRAME }), framework()],
+    ['an error frame, and chats outside the window', client({ other: ERROR_FRAME, main: listPage(entries(2)) }), framework({ windowStart: Number.MAX_SAFE_INTEGER })],
+  ] as const) {
+    const run = await pass(fake, side);
+    assert.deepEqual(run.outcome, { crawledCount: -1, crawledIds: [], reason, issue: reason }, what);
+  }
+});
+
+test('a list read in full that gave no chat in the window is a reading of none', async () => {
+  const run = await pass(client({ main: listPage(entries(2)) }), framework({ windowStart: Number.MAX_SAFE_INTEGER }));
+  assert.deepEqual(run.outcome, { crawledCount: 0, crawledIds: [], reason: 'Fetch successful.', issue: null });
 });
 
 test('a key read that gets no answer ends the pass before anything is sent, with its own reason', { timeout: 2000 }, async () => {

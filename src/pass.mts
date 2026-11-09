@@ -8,7 +8,7 @@ import type { DateString } from '@bric/rex-types/types';
 import { type Client } from './client.mts';
 import { uploadKeyId } from './keys.mts';
 import { TIMED_OUT, touch, withDeadline } from './pacing.mts';
-import { DISABLED, FETCH_SUCCESSFUL, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
+import { DISABLED, FETCH_SUCCESSFUL, NO_RESULTS, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
 import { type GeminiRecord, buildSummaryRecord } from './record.mts';
 import { type WalkStop, walkList } from './walk.mts';
 import { pageToken } from './wire.mts';
@@ -91,8 +91,9 @@ async function step<T>(call: () => Promise<T>, ms: number, keepAlive: () => unkn
 }
 
 // The walk's stop as the outcome this spider has always reported: an error
-// sends nothing, except that an HTTP error after chats in the window were
-// listed, and an expired session, send what was listed as a partial pass.
+// sends nothing, except that an HTTP error or an expired session after chats
+// in the window were listed send those, as a partial pass. Before any was
+// listed they are errors too, with no reading.
 function stopReason(stop: WalkStop, inWindow: number): string | null {
   switch (stop.kind) {
     case 'not-a-list':
@@ -103,7 +104,7 @@ function stopReason(stop: WalkStop, inWindow: number): string | null {
     case 'http':
       return inWindow === 0 ? listFailed(`List fetch failed (status ${stop.status})`) : null;
     case 'expired':
-      return null;
+      return inWindow === 0 ? listFailed('Session expired') : null;
     case 'disabled':
       return DISABLED;
   }
@@ -154,6 +155,9 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
       if (reason !== null) {
         return failed(reason);
       }
+    }
+    if (!walk.complete && crawledIds.length === 0) {
+      return failed(NO_RESULTS);
     }
 
     // Newest first, so a pass cut short has sent the most recent chats.
