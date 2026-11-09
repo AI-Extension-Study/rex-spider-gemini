@@ -15,23 +15,25 @@ const entry = (n: number) => listEntry(n, 1700000000 - n);
 // records the arguments of every call in order.
 function server(answers: Record<string, Answer>) {
   const calls: unknown[][] = [];
+  const sent: { url: string; at: string | null }[] = [];
   const client = {
-    postForm: async (_url: string, body: URLSearchParams): Promise<Answer> => {
+    postForm: async (url: string, body: URLSearchParams): Promise<Answer> => {
       const args = JSON.parse(JSON.parse(body.get('f.req') ?? '')[0][0][1]) as unknown[];
       calls.push(args);
+      sent.push({ url, at: body.get('at') });
       const answer = answers[`${JSON.stringify(args[2])} ${String(args[1])}`];
       if (answer === undefined) throw new Error(`no answer scripted for ${JSON.stringify(args)}`);
       return answer;
     },
   };
-  return { calls, client };
+  return { calls, sent, client };
 }
 
 function walk(answers: Record<string, Answer>, extra: { maxPages?: number } = {}) {
   const fake = server(answers);
   const waits: number[] = [];
   const result = walkList({ client: fake.client, sleep: async (ms) => { waits.push(ms); }, crawlDelay: () => 30_000, at: 'TOKEN', requestId: 123456, log: () => {}, ...extra });
-  return { result, calls: fake.calls, waits };
+  return { result, calls: fake.calls, sent: fake.sent, waits };
 }
 
 const key = (variant: unknown[], cursor: string | null) => `${JSON.stringify(variant)} ${String(cursor)}`;
@@ -108,6 +110,7 @@ test('an answer that stops the walk keeps what came before and names why', async
   const cases: [Answer, unknown][] = [
     [html, { kind: 'not-a-list' }],
     [{ kind: 'ok', status: 500, text: '' }, { kind: 'http', status: 500 }],
+    [{ kind: 'ok', status: 0, text: '' }, { kind: 'http', status: 0 }],
     [{ kind: 'timeout' }, { kind: 'timeout' }],
     [{ kind: 'network' }, { kind: 'network' }],
     [expired, { kind: 'expired' }],
@@ -127,4 +130,36 @@ test('a chat listed in both variants is returned once, with the entry the main l
   const result = await run.result;
   assert.deepEqual(ids(result.items), [chatId(1), chatId(2)]);
   assert.deepEqual(result.items[0].entry, main);
+});
+
+test('every call carries the page token and the request id it was given', async () => {
+  const run = walk({ [key(OTHER, null)]: page([entry(1)]), [key(MAIN, null)]: page([entry(2)]) });
+  await run.result;
+  assert.deepEqual(run.sent, [
+    { url: 'https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&hl=en&rt=c&_reqid=123456', at: 'TOKEN' },
+    { url: 'https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&hl=en&rt=c&_reqid=123456', at: 'TOKEN' },
+  ]);
+});
+
+test('an empty page that carries a new cursor is followed', async () => {
+  const run = walk({
+    [key(OTHER, null)]: page([], 'B2'),
+    [key(OTHER, 'B2')]: page([entry(1)]),
+    [key(MAIN, null)]: page([]),
+  });
+  const result = await run.result;
+  assert.deepEqual(run.calls, [[10, null, OTHER], [10, 'B2', OTHER], [10, null, MAIN]]);
+  assert.equal(result.complete, true);
+});
+
+test('each list keeps its own seen chats and cursors, so the main list is not cut for repeating the other', async () => {
+  const run = walk({
+    [key(OTHER, null)]: page([entry(1)], 'X'),
+    [key(OTHER, 'X')]: page([entry(2)]),
+    [key(MAIN, null)]: page([entry(1), entry(2)], 'X'),
+    [key(MAIN, 'X')]: page([entry(3)]),
+  });
+  const result = await run.result;
+  assert.deepEqual(run.calls, [[10, null, OTHER], [10, 'X', OTHER], [10, null, MAIN], [10, 'X', MAIN]]);
+  assert.deepEqual({ ids: ids(result.items), complete: result.complete }, { ids: [chatId(1), chatId(2), chatId(3)], complete: true });
 });
