@@ -192,10 +192,14 @@ test('an expired session before any chat in the window was listed reports no rea
 });
 
 test('a list read only in part that gave no chat in the window reports no reading', async () => {
-  const reason = 'Full fetch unsuccessful. No results returned.';
+  const reason = 'Error encountered parsing conversations: List read only in part, with no conversation in the crawl window.';
+  const outside = () => framework({ windowStart: Number.MAX_SAFE_INTEGER });
+  const unreadable = [null, 'Title', null, null, null, [T, 0], null, null, null, 1];
   for (const [what, fake, side] of [
     ['both lists answer an error frame', client({ other: ERROR_FRAME, main: ERROR_FRAME }), framework()],
-    ['an error frame, and chats outside the window', client({ other: ERROR_FRAME, main: listPage(entries(2)) }), framework({ windowStart: Number.MAX_SAFE_INTEGER })],
+    ['an error frame, and chats outside the window', client({ other: ERROR_FRAME, main: listPage(entries(2)) }), outside()],
+    ['an entry skipped, and no other', client({ main: listPage([unreadable]) }), framework()],
+    ['a list cut at a repeated cursor, its chats outside the window', client({ main: listPage(entries(2), 'A'), more: { A: listPage(entries(2), 'A') } }), outside()],
   ] as const) {
     const run = await pass(fake, side);
     assert.deepEqual(run.outcome, { crawledCount: -1, crawledIds: [], reason, issue: reason }, what);
