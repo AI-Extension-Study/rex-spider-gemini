@@ -98,3 +98,10 @@ test('a body without the batchexecute guard, or without a MaZiqc frame, is not a
   assert.deepEqual(parseListPage('<!doctype html><title>Sign in</title>'), { kind: 'not-a-list' });
   assert.deepEqual(parseListPage(batchResponse(wrb('ESY5D', [1]))), { kind: 'not-a-list' });
 });
+
+test('an entry whose time is outside 2001 to 2286, such as one in milliseconds, is skipped and counted', () => {
+  for (const seconds of [1.7e12, 5e8]) {
+    const page = parseListPage(batchResponse(wrb('MaZiqc', [null, null, [listEntry(1, 1700000000), listEntry(2, seconds)]])));
+    assert.deepEqual(page.kind === 'page' ? [page.items.map((item) => item.id), page.skipped] : page, [[chatId(1)], 1], String(seconds));
+  }
+});

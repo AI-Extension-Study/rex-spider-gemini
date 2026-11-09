@@ -1,6 +1,7 @@
 // One page of the chat list, the MaZiqc RPC. Pure.
 import { type Conversation, DateString } from '@bric/rex-types/types';
 
+import { isPlausibleSeconds } from './read.mts';
 import { rpcFrames } from './wire.mts';
 
 export const LIST_RPC = 'MaZiqc';
@@ -25,7 +26,7 @@ function readItem(chat: unknown): ListItem | null {
     return null;
   }
   const time = chat[5];
-  if (!Array.isArray(time) || typeof time[0] !== 'number' || !Number.isFinite(time[0])) {
+  if (!Array.isArray(time) || !isPlausibleSeconds(time[0])) {
     return null;
   }
   return { id: chat[0], endedSec: time[0], entry: chat };

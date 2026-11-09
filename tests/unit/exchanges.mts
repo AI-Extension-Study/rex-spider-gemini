@@ -14,6 +14,7 @@ export interface ExchangeSpec {
   response: number;
   parent?: number;
   seconds: number;
+  nanos?: number;
   drafts?: number;
   mimes?: string[];
 }
@@ -22,12 +23,12 @@ function attachment(mime: string): unknown[] {
   return [null, 1, `${MARKER}.png`, `https://example.invalid/${MARKER}`, null, `${MARKER}-token`, null, null, 1, [1700000000, 0], null, mime, null, null, null, []];
 }
 
-export function exchange({ chat, response, parent, seconds, drafts = 1, mimes = [] }: ExchangeSpec): unknown[] {
+export function exchange({ chat, response, parent, seconds, nanos = 457522000, drafts = 1, mimes = [] }: ExchangeSpec): unknown[] {
   const files = mimes.map(attachment);
   const prompt = [[`${MARKER} prompt`, null, null, null, [[null, null, null, files.length > 0 ? files : null, files.length > 0 ? files : null]]], 1, null, 1, `${MARKER}-hex`, null, null, null, false, null, []];
   const draftList = Array.from({ length: drafts }, (_, i) => [draftId(response * 10 + i), [`${MARKER} reply`], null, null, null, null, null, null, [], 'en']);
   const reply = [draftList, null, null, draftId(response * 10), null, null, null, null, `${MARKER}-region`, false, null, null, [], null, `${MARKER}-hex`, null, null, `${MARKER}-hex`, null, null, null, `${MARKER} model`, null, null, 6, 1, null, null, null, null, null, `${MARKER}-constant`];
-  return [[chat, responseId(response)], parent === undefined ? null : [chat, responseId(parent), draftId(parent * 10)], prompt, reply, [seconds, 457522000]];
+  return [[chat, responseId(response)], parent === undefined ? null : [chat, responseId(parent), draftId(parent * 10)], prompt, reply, [seconds, nanos]];
 }
 
 // A read answer: exchanges newest first, as the server sends them, and a

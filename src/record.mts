@@ -14,10 +14,9 @@ import { type Exchange, type ReadResult } from './read.mts';
 export interface GeminiTurn {
   readonly identifier: string;
   readonly parent: string | null;
-  // The exchange's time as an ISO instant, written as the record's own
-  // started and ended are.
+  // The exchange's time as an ISO instant, to the nanosecond the read gives.
   readonly when: string;
-  readonly drafts: number;
+  readonly drafts: number | null;
   readonly attachments: number;
   readonly attachment_types: readonly string[];
 }
@@ -51,22 +50,30 @@ export function buildSummaryRecord(item: ListItem): GeminiRecord {
   };
 }
 
+// An exact instant from whole seconds and nanoseconds; a float of seconds
+// would round the nanoseconds.
+function instant(exchange: Exchange): DateString {
+  const whole = new Date(exchange.whenSec * 1000).toISOString().slice(0, 19);
+  return new DateString(`${whole}.${String(exchange.whenNanos).padStart(9, '0')}Z`);
+}
+
 const turnOf = (exchange: Exchange): GeminiTurn => ({
   identifier: exchange.responseId,
   parent: exchange.parentId,
-  when: new DateString(exchange.whenSec).toJSON(),
+  when: instant(exchange).toJSON(),
   drafts: exchange.drafts,
   attachments: exchange.attachmentTypes.length,
   attachment_types: [...exchange.attachmentTypes],
 });
 
-// A record for a read that gave at least one exchange; the caller treats a
-// read that gave none as a failed one. started is set only when the read came
-// back whole, since a cut read lacks the oldest exchanges.
+// started is set only when the read came back whole, since otherwise the
+// oldest exchange may be missing. The read sends exchanges newest first:
+// reversed before the stable sort, two exchanges with one time keep their
+// order, a reply after the prompt it answers.
 export function buildDetailRecord(item: ListItem, read: Extract<ReadResult, { kind: 'read' }>): GeminiRecord {
   const summary = buildSummaryRecord(item);
-  const oldestFirst = [...read.exchanges].sort((a, b) => a.whenSec - b.whenSec);
-  const started = read.whole && oldestFirst.length > 0 ? new DateString(oldestFirst[0].whenSec) : undefined;
+  const oldestFirst = [...read.exchanges].reverse().sort((a, b) => a.whenSec - b.whenSec || a.whenNanos - b.whenNanos);
+  const started = read.whole && oldestFirst.length > 0 ? instant(oldestFirst[0]) : undefined;
   return {
     ...summary,
     is_summary: false,

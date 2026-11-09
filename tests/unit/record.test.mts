@@ -12,7 +12,7 @@ const entry = listEntry(1, 1700000300);
 const item: ListItem = { id: CHAT, endedSec: 1700000300, entry };
 
 function read(body: string) {
-  const result = parseRead(body);
+  const result = parseRead(body, CHAT);
   if (result.kind !== 'read') throw new Error(`Test setup invalid: the fixture did not parse as a read (${result.kind})`);
   return result;
 }
@@ -40,16 +40,16 @@ test('the detail record keeps the summary\'s metadata and ended, and adds starte
   assert.deepEqual(JSON.parse(JSON.stringify(buildDetailRecord(item, read(threeExchanges)))), {
     name: 'rex-conversation',
     is_summary: false,
-    date: 1700000100000,
+    date: 1700000100457,
     identifier: CHAT,
     turns: [
-      { identifier: responseId(1), parent: null, when: '2023-11-14T22:15:00Z', drafts: 1, attachments: 0, attachment_types: [] },
-      { identifier: responseId(2), parent: responseId(1), when: '2023-11-14T22:16:40Z', drafts: 1, attachments: 0, attachment_types: [] },
-      { identifier: responseId(3), parent: responseId(2), when: '2023-11-14T22:18:20Z', drafts: 2, attachments: 1, attachment_types: ['image/png'] },
+      { identifier: responseId(1), parent: null, when: '2023-11-14T22:15:00.457522Z', drafts: 1, attachments: 0, attachment_types: [] },
+      { identifier: responseId(2), parent: responseId(1), when: '2023-11-14T22:16:40.457522Z', drafts: 1, attachments: 0, attachment_types: [] },
+      { identifier: responseId(3), parent: responseId(2), when: '2023-11-14T22:18:20.457522Z', drafts: 2, attachments: 1, attachment_types: ['image/png'] },
     ],
     platform: 'gemini',
     ended: '2023-11-14T22:18:20Z',
-    started: '2023-11-14T22:15:00Z',
+    started: '2023-11-14T22:15:00.457522Z',
     metadata: entry,
   });
 });
@@ -77,7 +77,29 @@ test('both records give rex-spider the same last-message time, so their upload k
 });
 
 test('a whole read with no exchanges gives no started and is dated by its last message', () => {
-  const record = JSON.parse(JSON.stringify(buildDetailRecord(item, read(readResponse([])))));
+  // parseRead calls such a read an error; the builder is safe with one anyway.
+  const record = JSON.parse(JSON.stringify(buildDetailRecord(item, { kind: 'read', exchanges: [], whole: true, skipped: 0 })));
   assert.equal('started' in record, false, 'a read with no exchanges gave a start time');
   assert.deepEqual([record.date, record.turns], [1700000300000, []]);
+});
+
+test('a read that skipped an exchange gives no started', () => {
+  const oldest = exchange({ chat: CHAT, response: 1, seconds: 1700000100 });
+  oldest[4] = ['1700000100', 0];
+  const record = JSON.parse(JSON.stringify(buildDetailRecord(item, read(readResponse([exchange({ chat: CHAT, response: 2, parent: 1, seconds: 1700000200 }), oldest])))));
+  assert.equal('started' in record, false, 'a read missing an exchange gave a start time');
+});
+
+test('exchanges in one second are ordered by nanoseconds, and on a full tie a reply follows its prompt', () => {
+  // Sent oldest first here, so only the nanoseconds can put them in order.
+  const byNanos = read(readResponse([
+    exchange({ chat: CHAT, response: 1, seconds: 1700000100, nanos: 100000000 }),
+    exchange({ chat: CHAT, response: 2, parent: 1, seconds: 1700000100, nanos: 900000000 }),
+  ]));
+  assert.deepEqual(buildDetailRecord(item, byNanos).turns.map((turn) => turn.identifier), [responseId(1), responseId(2)]);
+  const tie = read(readResponse([
+    exchange({ chat: CHAT, response: 2, parent: 1, seconds: 1700000100, nanos: 0 }),
+    exchange({ chat: CHAT, response: 1, seconds: 1700000100, nanos: 0 }),
+  ]));
+  assert.deepEqual(buildDetailRecord(item, tie).turns.map((turn) => turn.identifier), [responseId(1), responseId(2)]);
 });
