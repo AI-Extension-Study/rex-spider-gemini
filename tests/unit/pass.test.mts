@@ -11,6 +11,9 @@ import { batchResponse, chatId, listEntry, wrb, wrbError } from './batch.mts';
 const HOMEPAGE: Answer = { kind: 'ok', status: 200, text: '<script>WIZ_global_data = {"SNlM0e":"PAGE-TOKEN:1"};</script>' };
 const listPage = (entries: unknown[][], next: string | null = null): Answer => ({ kind: 'ok', status: 200, text: batchResponse(wrb('MaZiqc', [null, next, entries])) });
 const EMPTY = listPage([]);
+// A list call answered with the BardErrorInfo an expired session gets.
+const EXPIRED: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wrb.fr","MaZiqc",null,null,null,[16],"generic",[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1096]]]]]\n` };
+const ERROR_FRAME: Answer = { kind: 'ok', status: 200, text: batchResponse(wrbError('MaZiqc', 3)) };
 
 // The spider's two list calls answered by variant: [1,null,1] first, then the
 // main list [0,null,1], each a single page unless a cursor is scripted.
@@ -163,16 +166,49 @@ test('a list answer that is not a list, or a list call that fails, ends the pass
 });
 
 test('an HTTP error after chats in the window were listed, or an expired session, sends them and reports partial', async () => {
-  const expired: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wrb.fr","MaZiqc",null,null,null,[16],"generic",[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1096]]]]]\n` };
-  for (const answer of [{ kind: 'ok', status: 500, text: '' } as Answer, expired]) {
+  for (const answer of [{ kind: 'ok', status: 500, text: '' } as Answer, EXPIRED]) {
     const run = await pass(client({ other: listPage(entries(2)), main: answer }), framework());
     assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [2, 'Full fetch unsuccessful. Partial results returned.', null]);
   }
 });
 
 test('a list error frame sends what was listed and reports partial', async () => {
-  const run = await pass(client({ other: { kind: 'ok', status: 200, text: batchResponse(wrbError('MaZiqc', 3)) }, main: listPage(entries(2)) }), framework());
+  const run = await pass(client({ other: ERROR_FRAME, main: listPage(entries(2)) }), framework());
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [2, 'Full fetch unsuccessful. Partial results returned.']);
+});
+
+// A count of 0 or more says crawledIds is a reading of the chats in the
+// window; from a list read only in part, an empty one would look like an
+// emptied account.
+test('an expired session before any chat in the window was listed reports no reading', async () => {
+  const reason = 'Error encountered parsing conversations: Session expired.';
+  for (const [what, fake, side] of [
+    ['at the first list call', client({ other: EXPIRED, main: listPage(entries(2)) }), framework()],
+    ['after chats outside the window', client({ other: listPage(entries(2)), main: EXPIRED }), framework({ windowStart: Number.MAX_SAFE_INTEGER })],
+  ] as const) {
+    const run = await pass(fake, side);
+    assert.deepEqual(run.outcome, { crawledCount: -1, crawledIds: [], reason, issue: reason }, what);
+  }
+});
+
+test('a list read only in part that gave no chat in the window reports no reading', async () => {
+  const reason = 'Error encountered parsing conversations: List read only in part, with no conversation in the crawl window.';
+  const outside = () => framework({ windowStart: Number.MAX_SAFE_INTEGER });
+  const unreadable = [null, 'Title', null, null, null, [T, 0], null, null, null, 1];
+  for (const [what, fake, side] of [
+    ['both lists answer an error frame', client({ other: ERROR_FRAME, main: ERROR_FRAME }), framework()],
+    ['an error frame, and chats outside the window', client({ other: ERROR_FRAME, main: listPage(entries(2)) }), outside()],
+    ['an entry skipped, and no other', client({ main: listPage([unreadable]) }), framework()],
+    ['a list cut at a repeated cursor, its chats outside the window', client({ main: listPage(entries(2), 'A'), more: { A: listPage(entries(2), 'A') } }), outside()],
+  ] as const) {
+    const run = await pass(fake, side);
+    assert.deepEqual(run.outcome, { crawledCount: -1, crawledIds: [], reason, issue: reason }, what);
+  }
+});
+
+test('a list read in full that gave no chat in the window is a reading of none', async () => {
+  const run = await pass(client({ main: listPage(entries(2)) }), framework({ windowStart: Number.MAX_SAFE_INTEGER }));
+  assert.deepEqual(run.outcome, { crawledCount: 0, crawledIds: [], reason: 'Fetch successful.', issue: null });
 });
 
 test('a key read that gets no answer ends the pass before anything is sent, with its own reason', { timeout: 2000 }, async () => {
@@ -225,30 +261,33 @@ test('a pass never throws: a framework call that throws ends it with an error re
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [-1, 'Error encountered parsing conversations: internal error (TypeError).']);
 });
 
-test('enabled turning false stops the walk before its next list call, and nothing is sent', async () => {
+test('enabled turning false stops the walk before its next list call, sends nothing and reports no reading', async () => {
   let calls = 0;
   const fake = client({ other: listPage(entries(1)), main: listPage(entries(2)) });
   // Read once before the homepage, once before the first list call.
   const side = framework({ enabled: () => (calls += 1) <= 2 });
   const run = await pass(fake, side);
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length], [0, 'Crawl stopped: spider disabled.', 0]);
+  // -1, not 0: a count of 0 or more says crawledIds is a reading of the
+  // chats in the window, and an empty one would read as an emptied account.
+  assert.deepEqual(run.outcome, { crawledCount: -1, crawledIds: [], reason: 'Crawl stopped: spider disabled.', issue: null });
+  assert.equal(run.sent.length, 0);
   assert.equal(fake.calls.filter((call) => call.startsWith('list')).length, 1, 'a list call went out after the spider was switched off');
   assert.equal(side.counts.reads, 0, 'chats were checked after the spider was switched off');
 });
 
-test('enabled turning false stops sending before the next batch', async () => {
+test('enabled turning false stops sending before the next batch, and the list read stays reported', async () => {
   let checks = 0;
   // The homepage and the two list calls read enabled once each; the first
   // batch reads it fourth.
   const side = framework({ enabled: () => (checks += 1) <= 4 });
   const run = await pass(client({ main: listPage(entries(3)) }), side, { batch: 2 });
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.map((record) => record.identifier)], [2, 'Crawl stopped: spider disabled.', [chatId(3), chatId(2)]]);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.crawledIds, run.outcome.reason, run.sent.map((record) => record.identifier)], [2, [chatId(1), chatId(2), chatId(3)], 'Crawl stopped: spider disabled.', [chatId(3), chatId(2)]]);
 });
 
-test('a spider switched off before its pass begins makes no request at all', async () => {
+test('a spider switched off before its pass begins makes no request and reports no reading', async () => {
   const fake = client({ main: listPage(entries(1)) });
   const run = await pass(fake, framework({ enabled: () => false }));
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, fake.calls], [0, 'Crawl stopped: spider disabled.', []]);
+  assert.deepEqual([run.outcome, fake.calls], [{ crawledCount: -1, crawledIds: [], reason: 'Crawl stopped: spider disabled.', issue: null }, []]);
 });
 
 test('a switch-off during the wait between list calls stops the next call', async () => {
@@ -267,7 +306,7 @@ test('a switch-off during the wait between list calls stops the next call', asyn
     limits: { settleMs: 1500, batch: 25, storeMs: 20 },
     log: () => {},
   });
-  assert.equal(outcome.reason, 'Crawl stopped: spider disabled.');
+  assert.deepEqual([outcome.crawledCount, outcome.reason], [-1, 'Crawl stopped: spider disabled.']);
   assert.equal(fake.calls.filter((call) => call.startsWith('list')).length, 1, 'the call after the wait went out with the config read before it');
 });
 

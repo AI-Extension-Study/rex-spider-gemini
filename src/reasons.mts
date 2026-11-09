@@ -11,3 +11,8 @@ export const homepageUnreachable = (kind: 'timeout' | 'network') => `Error encou
 export const listFailed = (what: string) => `Error encountered parsing conversations: ${what}.`;
 export const STORE_SILENT = 'Crawl stopped: the extension storage did not answer.';
 export const DISABLED = 'Crawl stopped: spider disabled.';
+// A list read only in part that gave no chat in the crawl window. It reports
+// no reading (count -1): an empty one would look like an emptied account.
+// It is worded as a list error, not as a partial fetch, since a partial
+// fetch's reason comes with a count and ids that are a reading.
+export const NO_RESULTS = listFailed('List read only in part, with no conversation in the crawl window');
