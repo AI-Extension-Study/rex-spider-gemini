@@ -58,8 +58,9 @@ function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Rec
 // unkeptStamps: a stamp that is answered but not written, as rex-spider's
 // logTransmitted resolves after a failed write. silentReadBacks: a read of a
 // key stamped in this pass gets no answer; silentReadsAfter: every key read
-// after that many. haltOnError false is what the served configs say.
-function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, haltOnError = false, enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
+// after that many; rejectedReadsAfter: every key read after that many
+// rejects. haltOnError false is what the served configs say.
+function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false, enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stampedNow = new Set<string>();
   const stamped: string[] = [];
@@ -76,6 +77,7 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
     checkIfAlreadyTransmitted: (id: string, ended: DateString) => {
       counts.reads += 1;
       const key = `${id} ${Math.round(ended.timestamp())}`;
+      if (counts.reads > rejectedReadsAfter) return Promise.reject(new TypeError('store broke'));
       return silentReads || (silentReadBacks && stampedNow.has(key)) || counts.reads > silentReadsAfter ? new Promise(() => {}) : Promise.resolve(keys.has(key));
     },
     logTransmitted: (id: string, ended: DateString) => {
@@ -737,6 +739,8 @@ test('the retry comes a day after a first failure that may pass, and a week afte
     ['a timeout', { kind: 'timeout' }, DAY],
     ['a network failure', { kind: 'network' }, DAY],
     ['HTTP 500', { kind: 'ok', status: 500, text: '' }, DAY],
+    ['HTTP 503', { kind: 'ok', status: 503, text: '' }, DAY],
+    ['HTTP 429', { kind: 'ok', status: 429, text: '' }, DAY],
     ['HTTP 404', { kind: 'ok', status: 404, text: '' }, 7 * DAY],
     ['an error frame', ERROR_READ, 7 * DAY],
     ['HTML', { kind: 'ok', status: 200, text: '<html></html>' }, 7 * DAY],
@@ -860,12 +864,18 @@ test('a failed read of a newer last message sends its summary and starts the mem
   assert.deepEqual(memoOf(store, 1), { ended: T * 1000, at: NOW + 60_000, retryMs: 7 * DAY, failures: 1 });
 });
 
-test('a rate limit or an overloaded server ends the reads, with no memo and no summary', async () => {
+test('a rate limit or an overloaded server sends the summary, holds the chat back, and ends the reads', async () => {
+  const wait = 'Crawl stopped: the server asked to wait.';
   for (const status of [429, 503]) {
-    const fake = client({ main: listPage(entries(2)), reads: { [chatId(2)]: { kind: 'ok', status, text: '' } } });
+    const fake = client({ main: listPage(entries(3)), reads: { [chatId(2)]: { kind: 'ok', status, text: '' } } });
+    const side = framework({ summarize: false });
     const store = fakeStore();
-    const run = await pass(fake, framework({ summarize: false }), {}, { store });
-    assert.deepEqual([readsOf(fake), run.sent, store.memos.size, run.outcome.reason], [[chatId(2)], [], 0, 'Fetch successful.'], String(status));
+    const run = await pass(fake, side, {}, { store });
+    assert.deepEqual(readsOf(fake), [chatId(3), chatId(2)], String(status));
+    assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary]), [[chatId(3), false], [chatId(2), true]], String(status));
+    // The record before it is stamped, and the memo written after a settle wait.
+    assert.deepEqual([keysOf(side), side.events.slice(-2), memoOf(store, 2)?.retryMs], [[`${chatId(3)}-detail`], ['wait 1500', `memo ${chatId(2)}`], DAY], String(status));
+    assert.deepEqual(run.outcome, { crawledCount: 2, crawledIds: [chatId(1), chatId(2), chatId(3)], reason: wait, issue: wait }, String(status));
   }
 });
 
@@ -876,12 +886,20 @@ test('chats held back by a memo neither count toward the run of failed reads nor
   assert.deepEqual([readsOf(fake), run.outcome.reason], [[chatId(5), chatId(3), chatId(2)], STOPPED]);
 });
 
-test('a chat that fails again does not count toward the run of failed reads', async () => {
+test('chats that fail again count toward the run of failed reads too', async () => {
+  // A read that fails for every chat would otherwise run through all the
+  // chats whose memos ran out, up to the budget.
   const again = (n: number): DetailMemo => ({ ended: (T + n - 1) * 1000, at: NOW - 8 * DAY, retryMs: 7 * DAY, failures: 1 });
   const fake = client({ main: listPage(entries(5)), reads: { [chatId(5)]: ERROR_READ, [chatId(4)]: ERROR_READ, [chatId(3)]: ERROR_READ } });
   const store = fakeStore({ memos: { [chatId(5)]: again(5), [chatId(4)]: again(4), [chatId(3)]: again(3) } });
   const run = await pass(fake, framework({ summarize: false }), {}, { store });
-  assert.deepEqual([readsOf(fake).length, run.outcome.reason], [5, 'Fetch successful.']);
+  assert.deepEqual([readsOf(fake), run.outcome.reason], [[chatId(5), chatId(4), chatId(3)], STOPPED]);
+});
+
+test('a summary key check that fails stops the sending, and no memo is written', async () => {
+  const store = fakeStore();
+  const run = await pass(client({ main: listPage(entries(1)), reads: { [chatId(1)]: ERROR_READ } }), framework({ summarize: false, rejectedReadsAfter: 2 }), {}, { store });
+  assert.deepEqual([run.sent, store.memos.size, run.outcome.crawledCount, run.outcome.reason], [[], 0, 0, 'Fetch successful.']);
 });
 
 test('failed reads after a list read only in part keep the partial reason, and name the failure as the issue', async () => {

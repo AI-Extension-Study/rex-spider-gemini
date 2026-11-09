@@ -12,7 +12,7 @@ import { type ListItem } from './list.mts';
 import { CLOCK_SKEW_MS, resendSince, sentAlready } from './mode.mts';
 import { TIMED_OUT, touch, withDeadline } from './pacing.mts';
 import { READ_RPC, type ReadResult, parseRead, readArgs } from './read.mts';
-import { DETAIL_FAILED, DISABLED, FETCH_SUCCESSFUL, NO_RESULTS, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
+import { DETAIL_FAILED, DISABLED, FETCH_SUCCESSFUL, NO_RESULTS, NO_TOKEN, PARTIAL, SERVER_WAIT, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
 import { type GeminiRecord, buildDetailRecord, buildSummaryRecord } from './record.mts';
 import { type DetailMemo, type GeminiStore, type Mode } from './store.mts';
 import { type WalkStop, walkList } from './walk.mts';
@@ -145,8 +145,9 @@ interface Sending {
 interface Sent {
   readonly sent: number;
   readonly disabled: boolean;
-  // The reads stopped because they failed.
-  readonly failedReads: boolean;
+  // Why failed reads ended the reads early, if they did: they kept failing,
+  // or the server asked to wait.
+  readonly stopped: 'failed' | 'wait' | null;
 }
 
 const kindOf = (error: unknown) => (error instanceof Error ? error.name : typeof error);
@@ -190,7 +191,7 @@ async function sendSummaries(ctx: Sending, records: readonly GeminiRecord[]): Pr
   let sent = 0;
   for (let start = 0; start < records.length; start += ctx.limits.batch) {
     if (!ctx.deps.framework.isEnabled()) {
-      return { sent, disabled: true, failedReads: false };
+      return { sent, disabled: true, stopped: null };
     }
     const batch: GeminiRecord[] = [];
     for (const record of records.slice(start, start + ctx.limits.batch)) {
@@ -202,11 +203,11 @@ async function sendSummaries(ctx: Sending, records: readonly GeminiRecord[]): Pr
     await ctx.deps.sleep(ctx.limits.settleMs);
     for (const record of batch) {
       if (!(await stamped(ctx, record))) {
-        return { sent, disabled: false, failedReads: false };
+        return { sent, disabled: false, stopped: null };
       }
     }
   }
-  return { sent, disabled: false, failedReads: false };
+  return { sent, disabled: false, stopped: null };
 }
 
 // crawl_delay as a wait. A value that is not a positive number is no wait, as
@@ -266,12 +267,14 @@ const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 
 // retry time. The summary's key is not stamped: a chat last used before the
 // re-send window would then count as sent in detail (mode.mts), and its
 // retry would never come. With halt_on_error the first failed read ends the
-// reads; without, failedRun first failures in a row do. A chat that fails
-// again says nothing about the next one, so it does not count.
+// reads; without, failedRun of them in a row do, repeats included, so a read
+// that fails for every chat stops early even when most have memos. A chat
+// held back by its memo neither counts nor resets the run.
 //
-// A rate limit (429) or an overloaded server (503) asks for a wait: the
-// reads end, and the chat is read in a later pass with no memo and no
-// summary. So does an expired session.
+// A rate limit (429) or an overloaded server (503) fails the read as one that
+// may pass, and also ends the reads, since the server asked to wait: under a
+// rate limit, one read per pass, and every chat still gets its summary. An
+// expired session ends the reads with no memo: it is not the chat's failure.
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
   const { client, framework, store } = deps;
@@ -279,7 +282,7 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
   const started = deps.now();
   let sent = 0;
   let failedInARow = 0;
-  let failedReads = false;
+  let stopped: 'failed' | 'wait' | null = null;
   let pending: Pending | null = null;
   for (const item of items) {
     if (deps.now() - started >= limits.detailBudgetMs) {
@@ -304,11 +307,11 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       const due: Pending = pending;
       pending = null;
       if (!(await written(ctx, due))) {
-        return { sent, disabled: false, failedReads: false };
+        return { sent, disabled: false, stopped: null };
       }
     }
     if (!framework.isEnabled()) {
-      return { sent, disabled: true, failedReads: false };
+      return { sent, disabled: true, stopped: null };
     }
     const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), ctx.at));
     const read = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseRead(answer.text, item.id) : null;
@@ -329,15 +332,9 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       log('the session expired during the detail reads; the chats not read are read in a later pass');
       break;
     }
-    if (answer.kind === 'ok' && (answer.status === 429 || answer.status === 503)) {
-      log(`a detail read was answered ${answer.status}; the chats not read are read in a later pass`);
-      break;
-    }
     log(`a detail read failed (${readFailure(answer, read)})`);
+    failedInARow += 1;
     const failures = (earlier?.failures ?? 0) + 1;
-    if (failures === 1) {
-      failedInARow += 1;
-    }
     let memoDue = true;
     if (failures === 1) {
       const summary = buildSummaryRecord(item);
@@ -346,7 +343,7 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
         sentBefore = await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), summary.ended), limits.storeMs, deps.keepAlive, log);
       } catch (error) {
         log(`a key read ${error instanceof StoreSilent ? 'got no answer' : `failed (${kindOf(error)})`}; sending stops for this pass`);
-        return { sent, disabled: false, failedReads: false };
+        return { sent, disabled: false, stopped: null };
       }
       if (!sentBefore) {
         if (dispatched(ctx, summary)) {
@@ -359,13 +356,19 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
         }
       }
     }
+    const asksToWait = answer.kind === 'ok' && (answer.status === 429 || answer.status === 503);
     if (memoDue) {
-      const mayPass = answer.kind !== 'ok' || answer.status >= 500;
+      const mayPass = answer.kind !== 'ok' || answer.status >= 500 || asksToWait;
       pending = { kind: 'memo', chatId: item.id, memo: { ended: endedMs, at: deps.now(), retryMs: mayPass && failures === 1 ? RETRY_SOON_MS : RETRY_LATE_MS, failures } };
+    }
+    if (asksToWait) {
+      log('the server asked to wait; the chats not read are read in a later pass');
+      stopped = 'wait';
+      break;
     }
     if (halts || failedInARow >= limits.failedRun) {
       log(halts ? 'a detail read failed and halt_on_error is set; the reads stop' : `${failedInARow} detail reads failed in a row; the reads stop`);
-      failedReads = true;
+      stopped = 'failed';
       break;
     }
   }
@@ -373,7 +376,7 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
     await deps.sleep(limits.settleMs);
     await written(ctx, pending);
   }
-  return { sent, disabled: false, failedReads };
+  return { sent, disabled: false, stopped };
 }
 
 export async function runPass(deps: PassDeps): Promise<PassOutcome> {
@@ -448,7 +451,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     // Newest first, so a pass cut short has sent the most recent chats.
     unsent.sort((a, b) => b.endedSec - a.endedSec);
     const ctx: Sending = { deps, limits, log, at };
-    const { sent, disabled, failedReads } = served === 'summary'
+    const { sent, disabled, stopped } = served === 'summary'
       ? await sendSummaries(ctx, unsent.map((item) => buildSummaryRecord(item)))
       : await sendDetails(ctx, unsent);
     // The reason says how the list was read; how much went out is the count.
@@ -459,11 +462,12 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (disabled) {
       return { crawledCount: sent, crawledIds, reason: DISABLED, issue: null };
     }
-    // Failed reads say so too: the list was read, but the chats in it were
-    // not, and a reader of the data should see that. A list read only in
-    // part says so first, since the ids are then not the whole list.
-    if (failedReads) {
-      return { crawledCount: sent, crawledIds, reason: walk.complete ? DETAIL_FAILED : PARTIAL, issue: DETAIL_FAILED };
+    // Reads ended by failures say so too: the list was read, but the chats
+    // in it were not, and a reader of the data should see that. A list read
+    // only in part says so first, since the ids are then not the whole list.
+    if (stopped !== null) {
+      const why = stopped === 'wait' ? SERVER_WAIT : DETAIL_FAILED;
+      return { crawledCount: sent, crawledIds, reason: walk.complete ? why : PARTIAL, issue: why };
     }
     return { crawledCount: sent, crawledIds, reason: walk.complete ? FETCH_SUCCESSFUL : PARTIAL, issue: null };
   } catch (error) {
