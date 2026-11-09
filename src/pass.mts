@@ -61,7 +61,8 @@ export interface PassOutcome {
   readonly issue: string | null;
 }
 
-const failed = (reason: string, issue: string = reason, crawledIds: string[] = []): PassOutcome => ({ crawledCount: -1, crawledIds, reason, issue });
+// An error sends nothing: every error stop comes before any chat was checked.
+const failed = (reason: string, issue: string = reason): PassOutcome => ({ crawledCount: -1, crawledIds: [], reason, issue });
 
 class StoreSilent extends Error {}
 
@@ -128,7 +129,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (walk.stop !== null) {
       const reason = stopReason(walk.stop, crawledIds.length);
       if (reason !== null) {
-        return failed(reason, reason, crawledIds);
+        return failed(reason);
       }
     }
 
@@ -159,7 +160,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
         }
       }
     }
-    const complete = walk.stop === null && walk.complete && !stampsStopped;
+    const complete = walk.complete && !stampsStopped;
     return { crawledCount: sent, crawledIds, reason: complete ? FETCH_SUCCESSFUL : PARTIAL, issue: null };
   } catch (error) {
     if (error instanceof StoreSilent) {

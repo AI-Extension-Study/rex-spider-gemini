@@ -103,3 +103,10 @@ test('withDeadline passes a rejection through, and a rejection after the deadlin
   reject(new Error('after the deadline'));
   await new Promise((resolve) => setTimeout(resolve, 20));
 });
+
+test('withDeadline leaves no timer behind once the promise has answered', async () => {
+  const timers = () => process.getActiveResourcesInfo().filter((kind) => kind === 'Timeout').length;
+  const before = timers();
+  await withDeadline(Promise.resolve('value'), 60_000);
+  assert.equal(timers(), before, 'a deadline timer is still running after the race');
+});

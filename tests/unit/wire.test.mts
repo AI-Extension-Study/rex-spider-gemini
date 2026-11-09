@@ -48,7 +48,7 @@ test('bardErrorCodes reads every BardErrorInfo code in order, and none without o
 
 test('pageToken reads the SNlM0e value from the homepage, and is null without one', () => {
   assert.equal(pageToken('<script>WIZ_global_data = {"FdrFJe":"1","SNlM0e":"AbCd-123:1700000000000","x":2};</script>'), 'AbCd-123:1700000000000');
-  for (const html of ['<html>Sign in</html>', '{"SNlM0e":""}', '{"SNlM0e":', '']) {
+  for (const html of ['<html>Sign in</html>', '{"SNlM0e":""}', '{"SNlM0e":', '{"SNlM0e":"no-closing-quote', '']) {
     assert.equal(pageToken(html), null, JSON.stringify(html));
   }
 });

@@ -22,9 +22,9 @@ function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Rec
       calls.push(`GET ${url}`);
       return home;
     },
-    postForm: async (_url: string, body: URLSearchParams): Promise<Answer> => {
+    postForm: async (url: string, body: URLSearchParams): Promise<Answer> => {
       const args = JSON.parse(JSON.parse(body.get('f.req') ?? '')[0][0][1]) as unknown[];
-      calls.push(`list ${JSON.stringify(args[2])} ${String(args[1])} at=${body.get('at')}`);
+      calls.push(`list ${JSON.stringify(args[2])} ${String(args[1])} at=${body.get('at')} ${url.slice(url.indexOf('_reqid='))}`);
       if (args[1] !== null) return more[String(args[1])];
       return JSON.stringify(args[2]) === '[0,null,1]' ? main : other;
     },
@@ -37,10 +37,15 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stamped: string[] = [];
   const events: string[] = [];
+  const counts = { reads: 0, stampTries: 0 };
   const fw: PassFramework = {
     crawlWindowContains: async (ms) => ms >= windowStart,
-    checkIfAlreadyTransmitted: (id: string, ended: DateString) => (silentReads ? new Promise(() => {}) : Promise.resolve(keys.has(`${id} ${Math.round(ended.timestamp())}`))),
+    checkIfAlreadyTransmitted: (id: string, ended: DateString) => {
+      counts.reads += 1;
+      return silentReads ? new Promise(() => {}) : Promise.resolve(keys.has(`${id} ${Math.round(ended.timestamp())}`));
+    },
     logTransmitted: (id: string, ended: DateString) => {
+      counts.stampTries += 1;
       if (silentStamps) return new Promise(() => {});
       stamped.push(`${id} ${Math.round(ended.timestamp())}`);
       events.push(`stamp ${id}`);
@@ -48,7 +53,7 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
     },
     fetchCrawlDelay: () => 30_000,
   };
-  return { fw, stamped, events };
+  return { fw, stamped, events, counts };
 }
 
 async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>, limits = {}) {
@@ -113,6 +118,7 @@ test('each homepage failure ends the pass before any list call, with its own rea
     [{ kind: 'timeout' }, 'Error encountered fetching network resource: timeout.', 'Error encountered fetching network resource: timeout.'],
     [{ kind: 'network' }, 'Error encountered fetching network resource: network.', 'Error encountered fetching network resource: network.'],
     [{ kind: 'ok', status: 503, text: '' }, 'Homepage fetch failed (status 503).', 'Unable to fetch https://gemini.google.com/app. Status code = 503.'],
+    [{ kind: 'ok', status: 404, text: '' }, 'Homepage fetch failed (status 404).', 'Unable to fetch https://gemini.google.com/app. Status code = 404.'],
     [{ kind: 'ok', status: 200, text: '<html>Sign in</html>' }, 'No access token found on homepage.', 'No access token found on homepage.'],
   ];
   for (const [home, reason, issue] of cases) {
@@ -123,10 +129,13 @@ test('each homepage failure ends the pass before any list call, with its own rea
   }
 });
 
-test('the list calls carry the page token the homepage gave this pass', async () => {
-  const fake = client({ main: listPage(entries(1)) });
-  await pass(fake, framework());
-  assert.ok(fake.calls.slice(1).every((call) => call.endsWith('at=PAGE-TOKEN:1')), fake.calls.join('\n'));
+test('the list calls carry this pass\'s page token and request id, and a later pass reads a new token', async () => {
+  const first = client({ main: listPage(entries(1)) });
+  await pass(first, framework());
+  assert.ok(first.calls.slice(1).every((call) => call.endsWith('at=PAGE-TOKEN:1 _reqid=123456')), first.calls.join('\n'));
+  const second = client({ home: { kind: 'ok', status: 200, text: '{"SNlM0e":"PAGE-TOKEN:2"}' }, main: listPage(entries(1)) });
+  await pass(second, framework());
+  assert.ok(second.calls.slice(1).every((call) => call.includes('at=PAGE-TOKEN:2 ')), second.calls.join('\n'));
 });
 
 test('a list answer that is not a list, or a list call that fails, ends the pass with an error and sends nothing', async () => {
@@ -137,8 +146,13 @@ test('a list answer that is not a list, or a list call that fails, ends the pass
     [{ kind: 'ok', status: 500, text: '' }, 'Error encountered parsing conversations: List fetch failed (status 500).'],
   ];
   for (const [answer, reason] of cases) {
-    const run = await pass(client({ other: listPage(entries(1)), main: answer }), framework({ windowStart: Number.MAX_SAFE_INTEGER }));
-    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length], [-1, reason, 0], reason);
+    // Chats listed before the failure lie outside the window only for the
+    // HTTP error, whose outcome depends on whether any was in it.
+    const http = answer.kind === 'ok' && answer.status === 500;
+    const side = framework({ windowStart: http ? Number.MAX_SAFE_INTEGER : 0 });
+    const run = await pass(client({ other: listPage(entries(1)), main: answer }), side);
+    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length, run.outcome.crawledIds], [-1, reason, 0, []], reason);
+    if (!http) assert.equal(side.counts.reads, 0, `${reason}: chats were checked after the list failed`);
   }
 });
 
@@ -146,7 +160,7 @@ test('an HTTP error after chats in the window were listed, or an expired session
   const expired: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wrb.fr","MaZiqc",null,null,null,[16],"generic",[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1096]]]]]\n` };
   for (const answer of [{ kind: 'ok', status: 500, text: '' } as Answer, expired]) {
     const run = await pass(client({ other: listPage(entries(2)), main: answer }), framework());
-    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [2, 'Full fetch unsuccessful. Partial results returned.']);
+    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [2, 'Full fetch unsuccessful. Partial results returned.', null]);
   }
 });
 
@@ -161,8 +175,9 @@ test('a key read that gets no answer ends the pass with an error before anything
 });
 
 test('a stamp that gets no answer stops the stamping, and the pass reports partial', { timeout: 2000 }, async () => {
-  const run = await pass(client({ main: listPage(entries(3)) }), framework({ silentStamps: true }));
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [3, 'Full fetch unsuccessful. Partial results returned.']);
+  const side = framework({ silentStamps: true });
+  const run = await pass(client({ main: listPage(entries(3)) }), side);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, side.counts.stampTries], [3, 'Full fetch unsuccessful. Partial results returned.', 1]);
 });
 
 test('a long check of the listed chats makes a keep-alive call every 100 chats', async () => {
