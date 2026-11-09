@@ -74,6 +74,9 @@ test('no text gets through: an extra key, or text in a turn field or a list posi
   metadata[4] = { text: MARKER };
   metadata[6] = [MARKER, 3];
   metadata[7] = [[1, MARKER]];
+  metadata[8] = [{ text: MARKER }, [{ text: MARKER }]];
+  // Lists are kept to three levels; a fourth is null.
+  metadata[10] = [[[[1]]]];
   const loaded = {
     ...record,
     title: MARKER,
@@ -88,7 +91,7 @@ test('no text gets through: an extra key, or text in a turn field or a list posi
   assert.equal(turns.length, 2, 'a turn that is not an object was kept');
   assert.deepEqual(Object.keys(turns[0]), ['identifier', 'parent', 'when', 'drafts', 'attachments', 'attachment_types']);
   assert.deepEqual([turns[0].when, turns[0].attachment_types], [null, ['other', 'image/png']]);
-  assert.deepEqual((out.metadata as unknown[]).slice(2, 8), [null, null, null, [T, 457522000], [null, 3], [[1, null]]]);
+  assert.deepEqual((out.metadata as unknown[]).slice(2, 11), [null, null, null, [T, 457522000], [null, 3], [[1, null]], [null, [null]], 1, [[[null]]]]);
 });
 
 test('a point that is not a record this module builds keeps only the scaffold', async () => {
@@ -189,11 +192,15 @@ test('records of every shape the builders make come back as they went in', async
   const fraction = entry(1, T + 0.5);
   cases.push(['seconds with a fraction', buildSummaryRecord({ id: chatId(1), endedSec: T + 0.5, entry: fraction })]);
   const marked = entry(1);
-  marked[2] = '0123456789abcdef';
+  marked[2] = 'x_0123456789abcdef';
   marked[3] = 'g_0123456789abcdef';
   marked[4] = [[T, 0], [T + 1, 5]];
   marked[6] = true;
-  cases.push(['list positions holding a bare or prefixed hex id, nested times and a flag', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked })]);
+  cases.push(['list positions holding prefixed hex ids, nested times and a flag', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked })]);
+  // A chat whose oldest exchange moved after the list call: no start.
+  const moved = parseRead(readResponse([exchange({ chat: chatId(1), response: 1, seconds: T + 5 })]), chatId(1));
+  assert.equal(moved.kind, 'read', 'Test setup invalid: the read did not parse');
+  cases.push(['a detail record whose oldest exchange is after the listed end', buildDetailRecord(item(1), moved as Extract<typeof moved, { kind: 'read' }>)]);
   for (const [what, record] of cases) {
     const out = await redactGemini(record, hash);
     const expected = plain(record);
@@ -210,8 +217,10 @@ test('a chat the list parser gives always reads as a record', async () => {
   }
 });
 
-test('a string at a list position is kept only as a hex id, whatever its prefix', async () => {
-  for (const [value, kept] of [['0123456789abcdef', true], ['gem_0123456789abcdef', true], ['0123456789ABCDEF', false], ['abc-DEF_123', false], ['deadbee', false], ['writer_0123456789abcdef', false]] as const) {
+test('a string at a list position is kept only as a prefixed hex id', async () => {
+  // A bare hex or digit string could be an account or session id, a phone number or a date.
+  const cases = [['x_0123456789abcdef', true], ['gem_0123456789abcdef', true], ['0123456789abcdef', false], ['5551234567', false], ['20261109', false], ['0123456789ABCDEF', false], ['abc-DEF_123', false], ['g_deadbee', false], ['writer_0123456789abcdef', false], ['ABC_0123456789abcdef', false]] as const;
+  for (const [value, kept] of cases) {
     const marked = entry(1);
     marked[2] = value;
     const out = await redactGemini(buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked }), hash);

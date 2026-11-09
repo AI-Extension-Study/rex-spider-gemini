@@ -109,15 +109,16 @@ function secondsOf(date: unknown, expected: number | null): number | null {
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
-// A string a list position may keep: lowercase hex of 8 or more digits, bare
-// or after a short lowercase prefix, the form every id seen so far takes.
-// No word or sentence has that form.
-const HEX_ID = /^(?:[a-z]{1,4}_)?[0-9a-f]{8,64}$/;
+// A string a list position may keep: a short lowercase prefix and lowercase
+// hex of 8 to 64 digits, the form every id in a list entry seen so far takes
+// (c_, rc_). A bare hex or digit string is not kept: it could be an account
+// or session id, a phone number or a date.
+const HEX_ID = /^[a-z]{1,4}_[0-9a-f]{8,64}$/;
 
 // A list-entry position kept as it is, when it can hold no text: null, a
-// flag, a finite number, a hex id, or a list of those, such as [seconds,
-// nanos], to three levels. Anything else is null, so the entry keeps its
-// positions: an object, or a string that is not a hex id.
+// flag, a finite number, a prefixed hex id, or a list of those, such as
+// [seconds, nanos], to three levels. Anything else is null, so the entry
+// keeps its positions: an object, or any other string.
 function keepPosition(value: unknown, depth = 0): unknown {
   if (value === null || typeof value === 'boolean') {
     return value;

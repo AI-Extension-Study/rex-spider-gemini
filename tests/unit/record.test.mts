@@ -122,3 +122,8 @@ test('a start after the listed end is left out, and the record is dated by its l
   const record = buildDetailRecord(item, read(readResponse([exchange({ chat: CHAT, response: 1, seconds: 1700000305 })])));
   assert.deepEqual(['started' in record, record.date], [false, 1700000300 * 1000]);
 });
+
+test('a start in the same second as the listed end is kept', () => {
+  const record = buildDetailRecord(item, read(readResponse([exchange({ chat: CHAT, response: 1, seconds: 1700000300, nanos: 900000000 })])));
+  assert.equal(record.started?.timestamp(), 1700000300 * 1000);
+});
