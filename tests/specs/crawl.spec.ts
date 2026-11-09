@@ -15,9 +15,12 @@ function batch(rpcid: string, payload: unknown): string {
   return `)]}'\n\n${chunk.length}\n${chunk}\n`
 }
 
-// The requests one crawl makes, as answerGemini writes them down.
-const LIST_CALL = (variant: string) => `POST /_/BardChatUi/data/batchexecute MaZiqc ${variant} at=TEST-TOKEN:1`
-const ONE_CRAWL = ['GET /app', LIST_CALL('[1,null,1]'), LIST_CALL('[0,null,1]')]
+// The requests one crawl makes, as answerGemini writes them down. A list
+// call shows its whole argument list: page size, cursor and variant.
+const LIST_CALL = (args: string) => `POST /_/BardChatUi/data/batchexecute MaZiqc ${args} at=TEST-TOKEN:1`
+const OTHER_LIST = LIST_CALL('[10,null,[1,null,1]]')
+const MAIN_LIST = LIST_CALL('[10,null,[0,null,1]]')
+const ONE_CRAWL = ['GET /app', OTHER_LIST, MAIN_LIST]
 
 // Answers the homepage and both list calls, and keeps each request: its URL,
 // and a line saying what it was. Anything but the homepage and a MaZiqc list
@@ -36,19 +39,19 @@ async function answerGemini(context, mainList: unknown[][], { homeStatus = 200, 
       return
     }
     const form = new URLSearchParams(request.postData() ?? '')
-    let variant = 'unreadable-f.req'
+    let args = 'unreadable-f.req'
     try {
-      variant = JSON.stringify(JSON.parse(JSON.parse(form.get('f.req') ?? '')[0][0][1])[2])
+      args = JSON.stringify(JSON.parse(JSON.parse(form.get('f.req') ?? '')[0][0][1]))
     } catch {
       // Written down as unreadable, and refused below.
     }
-    const call = `${request.method()} ${url.pathname} ${url.searchParams.get('rpcids')} ${variant} at=${form.get('at')}`
+    const call = `${request.method()} ${url.pathname} ${url.searchParams.get('rpcids')} ${args} at=${form.get('at')}`
     calls.push(call)
-    if (call !== LIST_CALL('[1,null,1]') && call !== LIST_CALL('[0,null,1]')) {
+    if (call !== OTHER_LIST && call !== MAIN_LIST) {
       await route.fulfill({ status: 404, body: '' })
       return
     }
-    const main = variant === '[0,null,1]'
+    const main = call === MAIN_LIST
     if (main) await beforeMain()
     await route.fulfill({ status: 200, contentType: 'application/json', body: batch('MaZiqc', main ? [null, null, mainList] : []) })
   })
@@ -146,15 +149,28 @@ test('a crawl whose homepage fails sends nothing and reports its reason and an i
   expect(round.result).toEqual({ sitesCrawled: ['gemini'], issues: [{ url: HOME, message: `Unable to fetch ${HOME}. Status code = 500.` }] })
 })
 
-// The alarm starts a round every minute, and a pass can take longer. The
-// crawling flag, set when a crawl starts, is what keeps two passes from
-// running at once.
+// The alarm starts a round every minute, and a pass can take longer.
+// rex-spider's crawling flag keeps two passes from running at once. It is set
+// when the store write made at the start of a crawl is answered, not when the
+// crawl is called, so a round within that write's round trip would still
+// start a second pass (a gap in rex-spider). Here the first crawl is held at
+// its main list call, well after that write.
 test('a round that starts while the spider is still crawling skips it', async ({ context, serviceWorker }) => {
   let reached: () => void = () => {}
-  const mainListAsked = new Promise<void>((resolve) => { reached = resolve })
+  const mainListAsked = new Promise<string>((resolve) => { reached = () => resolve('held at its main list call') })
   let release: () => void = () => {}
   const held = new Promise<void>((resolve) => { release = resolve })
-  const traffic = await answerGemini(context, [entry(1, T)], { beforeMain: () => { reached(); return held } })
+  // Only the first main list call is held: a second pass, if one started,
+  // runs through, and the test fails on its result rather than a timeout.
+  let mainCalls = 0
+  const traffic = await answerGemini(context, [entry(1, T)], {
+    beforeMain: () => {
+      mainCalls += 1
+      if (mainCalls > 1) return Promise.resolve()
+      reached()
+      return held
+    },
+  })
   await untilStoreOpen(serviceWorker)
   await configure(serviceWorker)
   await serviceWorker.evaluate(() => { self.eventRecorder.events = [] })
@@ -163,11 +179,13 @@ test('a round that starts while the spider is still crawling skips it', async ({
     self.rexCorePlugin.handleMessage({ messageType: 'beginBackgroundCrawls' }, null, resolve)
   }))
   const first = round()
-  await mainListAsked
+  // A first round that ends before its main list call fails here, showing
+  // its own result.
+  expect(await Promise.race([mainListAsked, first])).toBe('held at its main list call')
   const second = await round()
   release()
-  expect(await first).toEqual({ sitesCrawled: ['gemini'], issues: [] })
   expect(second).toEqual({ sitesCrawled: [], issues: [] })
+  expect(await first).toEqual({ sitesCrawled: ['gemini'], issues: [] })
   expect(traffic.calls).toEqual(ONE_CRAWL)
   const events = await serviceWorker.evaluate(() => self.eventRecorder.events)
   expect(completions(events)).toEqual([[-1, [], '[gemini] Still crawling.'], [1, [chat(1)], 'Fetch successful.']])
