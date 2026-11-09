@@ -1,7 +1,7 @@
 // One page of the chat list, the MaZiqc RPC. Pure.
 import { type Conversation, DateString } from '@bric/rex-types/types';
 
-import { isPlausibleSeconds } from './read.mts';
+import { isPlausibleSeconds } from './time.mts';
 import { rpcFrames } from './wire.mts';
 
 export const LIST_RPC = 'MaZiqc';

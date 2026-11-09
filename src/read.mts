@@ -11,6 +11,7 @@
 // are the list at prompt[0][4][0][3], each entry with its MIME type at [11]
 // (seen for one pasted image only). Exchanges come newest first, and a read
 // cut short carries a cursor in payload[1].
+import { isPlausibleSeconds } from './time.mts';
 import { rpcFrames } from './wire.mts';
 
 export const READ_RPC = 'hNvQHb';
@@ -24,11 +25,6 @@ export function readArgs(chatId: string): unknown[] {
 }
 
 const RESPONSE_ID = /^r_[0-9a-f]{16}$/;
-
-// Exchange times outside these bounds (2001 to 2286) are not seconds; a time
-// in milliseconds would otherwise read as a date some 50,000 years ahead.
-const EARLIEST_SECONDS = 1e9;
-const LATEST_SECONDS = 1e10;
 
 // The attachment kinds a record may name; any other MIME type is 'other',
 // since a type string is not checked further than this list.
@@ -54,19 +50,16 @@ export type ReadResult =
   | { readonly kind: 'error'; readonly code: number | null }
   | { readonly kind: 'not-a-read' };
 
-export function isPlausibleSeconds(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= EARLIEST_SECONDS && value < LATEST_SECONDS;
-}
-
 const at = (value: unknown, ...path: number[]): unknown => path.reduce<unknown>((node, index) => (Array.isArray(node) ? node[index] : undefined), value);
 
 function attachmentTypes(files: unknown): string[] {
   if (!Array.isArray(files)) {
     return [];
   }
-  return files.filter((file) => typeof at(file, 11) === 'string').map((file) => {
-    const mime = at(file, 11) as string;
-    return ATTACHMENT_TYPES.has(mime) ? mime : 'other';
+  // An entry whose type string is missing or moved still counts, as other.
+  return files.filter((file) => Array.isArray(file)).map((file) => {
+    const mime = at(file, 11);
+    return typeof mime === 'string' && ATTACHMENT_TYPES.has(mime) ? mime : 'other';
   });
 }
 

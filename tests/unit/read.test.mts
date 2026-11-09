@@ -127,10 +127,24 @@ test('an exchange of another chat is skipped', () => {
   assert.deepEqual(result.kind === 'read' ? [result.exchanges.map((e) => e.responseId), result.skipped] : result, [[responseId(1)], 1]);
 });
 
-test('only file entries that carry a type string are counted', () => {
+test('only entries that are lists count as files, and one without a type string counts as other', () => {
   const ex = exchange({ chat: CHAT, response: 1, seconds: 1700000100, mimes: ['image/png'] });
   const files = (((ex[2] as unknown[])[0] as unknown[])[4] as unknown[][])[0][3] as unknown[];
   files.push(null, 'stray', [null, 1, 'name.png']);
   const result = parseRead(readResponse([ex]), CHAT);
-  assert.deepEqual(result.kind === 'read' ? result.exchanges[0].attachmentTypes : result, ['image/png']);
+  assert.deepEqual(result.kind === 'read' ? result.exchanges[0].attachmentTypes : result, ['image/png', 'other']);
+});
+
+test('a missing, negative, oversized or fractional nanosecond value reads as 0', () => {
+  for (const time of [[1700000100], [1700000100, -1], [1700000100, 1e9], [1700000100, 1.5]]) {
+    const ex = exchange({ chat: CHAT, response: 1, seconds: 1700000100 });
+    ex[4] = time;
+    const result = parseRead(readResponse([ex]), CHAT);
+    assert.equal(result.kind === 'read' ? result.exchanges[0].whenNanos : result.kind, 0, JSON.stringify(time));
+  }
+});
+
+test('1e9 is the first plausible second and 1e10 the first that is not', () => {
+  const result = parseRead(readResponse([exchange({ chat: CHAT, response: 2, seconds: 1e10 }), exchange({ chat: CHAT, response: 1, seconds: 1e9 })]), CHAT);
+  assert.deepEqual(result.kind === 'read' ? [result.exchanges.map((e) => e.responseId), result.skipped] : result, [[responseId(1)], 1]);
 });

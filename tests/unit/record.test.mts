@@ -40,7 +40,7 @@ test('the detail record keeps the summary\'s metadata and ended, and adds starte
   assert.deepEqual(JSON.parse(JSON.stringify(buildDetailRecord(item, read(threeExchanges)))), {
     name: 'rex-conversation',
     is_summary: false,
-    date: 1700000100457,
+    date: 1700000100000,
     identifier: CHAT,
     turns: [
       { identifier: responseId(1), parent: null, when: '2023-11-14T22:15:00.457522Z', drafts: 1, attachments: 0, attachment_types: [] },
@@ -49,7 +49,7 @@ test('the detail record keeps the summary\'s metadata and ended, and adds starte
     ],
     platform: 'gemini',
     ended: '2023-11-14T22:18:20Z',
-    started: '2023-11-14T22:15:00.457522Z',
+    started: '2023-11-14T22:15:00Z',
     metadata: entry,
   });
 });
@@ -102,4 +102,17 @@ test('exchanges in one second are ordered by nanoseconds, and on a full tie a re
     exchange({ chat: CHAT, response: 1, seconds: 1700000100, nanos: 0 }),
   ]));
   assert.deepEqual(buildDetailRecord(item, tie).turns.map((turn) => turn.identifier), [responseId(1), responseId(2)]);
+});
+
+test('a one-exchange chat starts at the same whole second it ends, never after', () => {
+  const one = read(readResponse([exchange({ chat: CHAT, response: 1, seconds: 1700000300, nanos: 457522000 })]));
+  const record = buildDetailRecord(item, one);
+  assert.ok(record.started !== undefined, 'Test setup invalid: a whole one-exchange read gave no started');
+  assert.ok(record.started.timestamp() <= record.ended.timestamp(), `started ${record.started.toJSON()} is after ended ${record.ended.toJSON()}`);
+  assert.equal(record.date, 1700000300000);
+});
+
+test('when keeps a nanosecond value below 0.1 s exactly', () => {
+  const tiny = read(readResponse([exchange({ chat: CHAT, response: 1, seconds: 1700000100, nanos: 5000 })]));
+  assert.equal(buildDetailRecord(item, tiny).turns[0].when, '2023-11-14T22:15:00.000005Z');
 });

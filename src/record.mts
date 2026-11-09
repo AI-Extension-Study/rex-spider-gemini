@@ -67,13 +67,16 @@ const turnOf = (exchange: Exchange): GeminiTurn => ({
 });
 
 // started is set only when the read came back whole, since otherwise the
-// oldest exchange may be missing. The read sends exchanges newest first:
+// oldest exchange may be missing. It is whole seconds, as ended is (the
+// upload key is built from ended), so a chat never starts after it ends;
+// the nanoseconds stay in each turn's when. The read sends exchanges newest
+// first:
 // reversed before the stable sort, two exchanges with one time keep their
 // order, a reply after the prompt it answers.
 export function buildDetailRecord(item: ListItem, read: Extract<ReadResult, { kind: 'read' }>): GeminiRecord {
   const summary = buildSummaryRecord(item);
   const oldestFirst = [...read.exchanges].reverse().sort((a, b) => a.whenSec - b.whenSec || a.whenNanos - b.whenNanos);
-  const started = read.whole && oldestFirst.length > 0 ? instant(oldestFirst[0]) : undefined;
+  const started = read.whole && oldestFirst.length > 0 ? new DateString(oldestFirst[0].whenSec) : undefined;
   return {
     ...summary,
     is_summary: false,
