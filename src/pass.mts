@@ -12,9 +12,9 @@ import { type ListItem } from './list.mts';
 import { resendSince, sentAlready } from './mode.mts';
 import { TIMED_OUT, touch, withDeadline } from './pacing.mts';
 import { READ_RPC, type ReadResult, parseRead, readArgs } from './read.mts';
-import { DISABLED, FETCH_SUCCESSFUL, NO_RESULTS, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
+import { DETAIL_FAILED, DISABLED, FETCH_SUCCESSFUL, NO_RESULTS, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
 import { type GeminiRecord, buildDetailRecord, buildSummaryRecord } from './record.mts';
-import { type GeminiStore, type Mode } from './store.mts';
+import { type DetailMemo, type GeminiStore, type Mode } from './store.mts';
 import { type WalkStop, walkList } from './walk.mts';
 import { bardErrorCodes, batchBody, batchUrl, pageToken } from './wire.mts';
 
@@ -24,10 +24,12 @@ export const HOME_URL = 'https://gemini.google.com/app';
 // storage and the key calls rex-core's store, which never answers while its
 // database is not open, so each runs to a deadline. isEnabled is the served
 // config as of now, read before each request and each batch; justSummarize
-// is the served mode, read once per pass.
+// is the served mode and continueAfterError the served halt_on_error, false
+// for true, each read once per pass.
 export interface PassFramework {
   isEnabled(): boolean;
   justSummarize(): boolean;
+  continueAfterError(): boolean;
   crawlWindowContains(timestamp: number): Promise<boolean>;
   checkIfAlreadyTransmitted(identifier: string, updated: DateString): Promise<boolean>;
   logTransmitted(identifier: string, updated: DateString): Promise<void>;
@@ -54,15 +56,20 @@ export interface PassLimits {
   // chats to read would hold the others back for hours. The chats it does not
   // reach keep no key and are read in a later pass.
   readonly detailBudgetMs: number;
+  // Failed detail reads in a row that end a pass's reads when halt_on_error
+  // is false: past a few, the reads are failing for a reason the next chats
+  // share.
+  readonly failedRun: number;
 }
 
-export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000 };
+export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000, failedRun: 3 };
 
 export interface PassDeps {
   readonly client: Pick<Client, 'get' | 'postForm'>;
   readonly framework: PassFramework;
-  // rex-core's store, for the mode record (mode.mts).
-  readonly store: Pick<GeminiStore, 'mode'>;
+  // rex-core's store, for the mode record (mode.mts) and the memos of
+  // failed detail reads.
+  readonly store: Pick<GeminiStore, 'mode' | 'memo'>;
   // Epoch ms.
   readonly now: () => number;
   readonly dispatch: (record: GeminiRecord) => void;
@@ -138,6 +145,8 @@ interface Sending {
 interface Sent {
   readonly sent: number;
   readonly disabled: boolean;
+  // The reads stopped because they failed.
+  readonly failedReads: boolean;
 }
 
 const kindOf = (error: unknown) => (error instanceof Error ? error.name : typeof error);
@@ -181,7 +190,7 @@ async function sendSummaries(ctx: Sending, records: readonly GeminiRecord[]): Pr
   let sent = 0;
   for (let start = 0; start < records.length; start += ctx.limits.batch) {
     if (!ctx.deps.framework.isEnabled()) {
-      return { sent, disabled: true };
+      return { sent, disabled: true, failedReads: false };
     }
     const batch: GeminiRecord[] = [];
     for (const record of records.slice(start, start + ctx.limits.batch)) {
@@ -193,11 +202,11 @@ async function sendSummaries(ctx: Sending, records: readonly GeminiRecord[]): Pr
     await ctx.deps.sleep(ctx.limits.settleMs);
     for (const record of batch) {
       if (!(await stamped(ctx, record))) {
-        return { sent, disabled: false };
+        return { sent, disabled: false, failedReads: false };
       }
     }
   }
-  return { sent, disabled: false };
+  return { sent, disabled: false, failedReads: false };
 }
 
 // crawl_delay as a wait. A value that is not a positive number is no wait, as
@@ -218,42 +227,94 @@ function readFailure(answer: Answer, read: Exclude<ReadResult, { kind: 'read' }>
   return read.kind === 'error' ? `error frame, code ${read.code}` : 'not a read';
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// When a chat whose read failed is read again: a day after a first failure
+// that may pass by itself (no answer, or a 5xx), a week after any other or a
+// repeat. A chat with a newer last message is read at once.
+export const RETRY_SOON_MS = DAY_MS;
+export const RETRY_LATE_MS = 7 * DAY_MS;
+
+// A write that waits for the wait before the next read, as a stamp waits for
+// its record to be stored: a detail record's stamp, or the memo of a failed
+// read, whose summary record may have just gone out.
+type Pending =
+  | { readonly kind: 'stamp'; readonly record: GeminiRecord }
+  | { readonly kind: 'memo'; readonly chatId: string; readonly memo: DetailMemo };
+
+// A memo that is not kept stops the sending, as a stamp does: next pass would
+// read the chat again at once and send its summary again.
+async function memoKept(ctx: Sending, chatId: string, memo: DetailMemo): Promise<boolean> {
+  touch(ctx.deps.keepAlive, ctx.log);
+  const answer = await ctx.deps.store.memo.set(chatId, memo);
+  if (!answer.ok) {
+    ctx.log('a detail memo was not kept; sending stops for this pass');
+  }
+  return answer.ok;
+}
+
+const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 'stamp' ? stamped(ctx, due.record) : memoKept(ctx, due.chatId, due.memo));
+
 // Detail mode: each chat read in turn, crawl_delay apart and never closer
 // than the settle wait, until the detail budget is spent. The floor keeps a
 // served crawl_delay of 0, or one that is not a number, from firing reads
-// back to back. A record's key is stamped after the wait before the next
-// read, or after a settle wait at the end. A failed read sends and stamps
-// nothing for its chat, so a later pass reads it again.
+// back to back. A record's key, or a failed read's memo, is written after
+// the wait before the next read, or after a settle wait at the end.
+//
+// A failed read sends the chat's summary record in the detail's place, once
+// per last message, and writes a memo that holds the chat back until its
+// retry time. The summary's key is not stamped: a chat last used before the
+// re-send window would then count as sent in detail (mode.mts), and its
+// retry would never come. With halt_on_error the first failed read ends the
+// reads; without, failedRun of them in a row do.
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
-  const { client, framework } = deps;
+  const { client, framework, store } = deps;
+  const halts = !framework.continueAfterError();
   const started = deps.now();
   let sent = 0;
-  // The record sent last, its key not stamped yet.
-  let unstamped: GeminiRecord | null = null;
+  let failedInARow = 0;
+  let failedReads = false;
+  let pending: Pending | null = null;
   for (const item of items) {
     if (deps.now() - started >= limits.detailBudgetMs) {
       log('the detail budget is spent; the chats not read are read in a later pass');
       break;
     }
+    const endedMs = item.endedSec * 1000;
+    touch(deps.keepAlive, log);
+    const memo = await store.memo.get(item.id);
+    if (memo.unanswered) {
+      log('a detail memo got no answer; its chat is read in a later pass');
+      continue;
+    }
+    const earlier = memo.value !== null && memo.value.ended === endedMs ? memo.value : null;
+    if (earlier !== null && deps.now() < earlier.at + earlier.retryMs) {
+      continue;
+    }
     await deps.sleep(Math.max(paceMs(framework), limits.settleMs));
-    if (unstamped !== null) {
-      const record: GeminiRecord = unstamped;
-      unstamped = null;
-      if (!(await stamped(ctx, record))) {
-        return { sent, disabled: false };
+    if (pending !== null) {
+      const due: Pending = pending;
+      pending = null;
+      if (!(await written(ctx, due))) {
+        return { sent, disabled: false, failedReads: false };
       }
     }
     if (!framework.isEnabled()) {
-      return { sent, disabled: true };
+      return { sent, disabled: true, failedReads: false };
     }
     const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), ctx.at));
     const read = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseRead(answer.text, item.id) : null;
     if (read !== null && read.kind === 'read') {
+      failedInARow = 0;
+      if (memo.value !== null || memo.malformed) {
+        touch(deps.keepAlive, log);
+        await store.memo.clear(item.id);
+      }
       const record = buildDetailRecord(item, read);
       if (dispatched(ctx, record)) {
         sent += 1;
-        unstamped = record;
+        pending = { kind: 'stamp', record };
       }
       continue;
     }
@@ -262,12 +323,37 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       break;
     }
     log(`a detail read failed (${readFailure(answer, read)})`);
+    failedInARow += 1;
+    const failures = (earlier?.failures ?? 0) + 1;
+    if (failures === 1) {
+      const summary = buildSummaryRecord(item);
+      let sentBefore: boolean;
+      try {
+        sentBefore = await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), summary.ended), limits.storeMs, deps.keepAlive, log);
+      } catch (error) {
+        if (!(error instanceof StoreSilent)) {
+          throw error;
+        }
+        log('a key read got no answer; sending stops for this pass');
+        return { sent, disabled: false, failedReads: false };
+      }
+      if (!sentBefore && dispatched(ctx, summary)) {
+        sent += 1;
+      }
+    }
+    const mayPass = answer.kind !== 'ok' || answer.status >= 500;
+    pending = { kind: 'memo', chatId: item.id, memo: { ended: endedMs, at: deps.now(), retryMs: mayPass && failures === 1 ? RETRY_SOON_MS : RETRY_LATE_MS, failures } };
+    if (halts || failedInARow >= limits.failedRun) {
+      log(halts ? 'a detail read failed and halt_on_error is set; the reads stop' : `${failedInARow} detail reads failed in a row; the reads stop`);
+      failedReads = true;
+      break;
+    }
   }
-  if (unstamped !== null) {
+  if (pending !== null) {
     await deps.sleep(limits.settleMs);
-    await stamped(ctx, unstamped);
+    await written(ctx, pending);
   }
-  return { sent, disabled: false };
+  return { sent, disabled: false, failedReads };
 }
 
 export async function runPass(deps: PassDeps): Promise<PassOutcome> {
@@ -342,7 +428,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     // Newest first, so a pass cut short has sent the most recent chats.
     unsent.sort((a, b) => b.endedSec - a.endedSec);
     const ctx: Sending = { deps, limits, log, at };
-    const { sent, disabled } = served === 'summary'
+    const { sent, disabled, failedReads } = served === 'summary'
       ? await sendSummaries(ctx, unsent.map((item) => buildSummaryRecord(item)))
       : await sendDetails(ctx, unsent);
     // The reason says how the list was read; how much went out is the count.
@@ -352,6 +438,11 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     // the config stopped as a full listing.
     if (disabled) {
       return { crawledCount: sent, crawledIds, reason: DISABLED, issue: null };
+    }
+    // Failed reads say so too: the list was read, but the chats in it were
+    // not, and a reader of the data should see that.
+    if (failedReads) {
+      return { crawledCount: sent, crawledIds, reason: DETAIL_FAILED, issue: DETAIL_FAILED };
     }
     return { crawledCount: sent, crawledIds, reason: walk.complete ? FETCH_SUCCESSFUL : PARTIAL, issue: null };
   } catch (error) {
