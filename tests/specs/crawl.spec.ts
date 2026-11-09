@@ -15,29 +15,44 @@ function batch(rpcid: string, payload: unknown): string {
   return `)]}'\n\n${chunk.length}\n${chunk}\n`
 }
 
-// Answers the homepage and both list calls, and keeps every URL requested.
-// Anything else, such as a list call without this page's token, gets a 404.
-async function answerGemini(context, mainList: unknown[][], homeStatus = 200) {
-  const requested: string[] = []
+// The requests one crawl makes, as answerGemini writes them down.
+const LIST_CALL = (variant: string) => `POST /_/BardChatUi/data/batchexecute MaZiqc ${variant} at=TEST-TOKEN:1`
+const ONE_CRAWL = ['GET /app', LIST_CALL('[1,null,1]'), LIST_CALL('[0,null,1]')]
+
+// Answers the homepage and both list calls, and keeps each request: its URL,
+// and a line saying what it was. Anything but the homepage and a MaZiqc list
+// call with this page's token gets a 404, and its line shows what was wrong.
+// beforeMain, if given, is awaited before the main list is answered.
+async function answerGemini(context, mainList: unknown[][], { homeStatus = 200, beforeMain = async () => {} } = {}) {
+  const urls: string[] = []
+  const calls: string[] = []
   await context.route('https://gemini.google.com/**', async (route) => {
     const request = route.request()
-    requested.push(request.url())
+    urls.push(request.url())
     const url = new URL(request.url())
     if (url.pathname === '/app') {
+      calls.push(`${request.method()} /app`)
       await route.fulfill({ status: homeStatus, contentType: 'text/html', body: '<script>WIZ_global_data = {"SNlM0e":"TEST-TOKEN:1"};</script>' })
       return
     }
     const form = new URLSearchParams(request.postData() ?? '')
-    const listCall = url.pathname === '/_/BardChatUi/data/batchexecute' && url.searchParams.get('rpcids') === 'MaZiqc' && form.get('at') === 'TEST-TOKEN:1'
-    if (!listCall) {
+    let variant = 'unreadable-f.req'
+    try {
+      variant = JSON.stringify(JSON.parse(JSON.parse(form.get('f.req') ?? '')[0][0][1])[2])
+    } catch {
+      // Written down as unreadable, and refused below.
+    }
+    const call = `${request.method()} ${url.pathname} ${url.searchParams.get('rpcids')} ${variant} at=${form.get('at')}`
+    calls.push(call)
+    if (call !== LIST_CALL('[1,null,1]') && call !== LIST_CALL('[0,null,1]')) {
       await route.fulfill({ status: 404, body: '' })
       return
     }
-    const args = JSON.parse(JSON.parse(form.get('f.req') ?? '[]')[0][0][1])
-    const main = JSON.stringify(args[2]) === '[0,null,1]'
+    const main = variant === '[0,null,1]'
+    if (main) await beforeMain()
     await route.fulfill({ status: 200, contentType: 'application/json', body: batch('MaZiqc', main ? [null, null, mainList] : []) })
   })
-  return requested
+  return { urls, calls }
 }
 
 // rex-core answers store messages only once its database is open; a crawl
@@ -55,9 +70,11 @@ async function untilStoreOpen(serviceWorker) {
 }
 
 // The served config as rex-spider applies it, the spider's block merged over
-// its defaults. sleep_delay 0 lets the next crawl start at once.
+// its defaults. rex-spider starts a crawl once more than sleep_delay ms have
+// passed since the last one; -1 lets the next start at once, even within the
+// same millisecond.
 async function configure(serviceWorker) {
-  await serviceWorker.evaluate(() => self.rexSpiderPlugin.updateConfiguration({ spiders: { gemini: { enabled: true, crawl_delay: 10, sleep_delay: 0 } } }))
+  await serviceWorker.evaluate(() => self.rexSpiderPlugin.updateConfiguration({ spiders: { gemini: { enabled: true, crawl_delay: 10, sleep_delay: -1 } } }))
 }
 
 // One round of the extension's alarm: each registered, enabled spider crawls,
@@ -93,36 +110,65 @@ const completions = (events) => events
   .map((event) => [event.event_details.crawled_count, event.event_details.crawled_ids, event.event_details.reason])
 
 test('a crawl sends a summary record per listed chat, newest first, and the next crawl sends none', async ({ context, serviceWorker }) => {
-  const requested = await answerGemini(context, [entry(1, T), entry(2, T + 60)])
+  const traffic = await answerGemini(context, [entry(1, T), entry(2, T + 60)])
   await untilStoreOpen(serviceWorker)
   await configure(serviceWorker)
 
   const first = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual(ONE_CRAWL)
   expect(first.result).toEqual({ sitesCrawled: ['gemini'], issues: [] })
   expect(records(first.events)).toEqual([summary(2, T + 60, '2023-11-14T22:14:20Z'), summary(1, T, '2023-11-14T22:13:20Z')])
   expect(completions(first.events)).toEqual([[2, [chat(1), chat(2)], 'Fetch successful.']])
 
   const second = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual(ONE_CRAWL)
   expect(records(second.events)).toEqual([])
   expect(completions(second.events)).toEqual([[0, [chat(1), chat(2)], 'Fetch successful.']])
 
-  // rex-spider turns these patterns into rules that let the spider's own
-  // requests through any blocking rules the extension sets. A request they
-  // miss could be blocked.
+  // rex-spider serves these patterns, and the extension makes them rules that
+  // let the spider's own requests through any blocking rules it sets. A
+  // request they miss could be blocked.
   const allowed = await serviceWorker.evaluate(() => new Promise((resolve) => {
     self.rexCorePlugin.handleMessage({ messageType: 'fetchAllowedURLs' }, null, resolve)
   }))
-  expect(requested.length).toBeGreaterThan(0)
-  expect(requested.filter((url) => !allowed.some((pattern) => new RegExp(pattern).test(url)))).toEqual([])
+  expect(traffic.urls.filter((url) => !allowed.some((pattern) => new RegExp(pattern).test(url)))).toEqual([])
 })
 
 test('a crawl whose homepage fails sends nothing and reports its reason and an issue', async ({ context, serviceWorker }) => {
-  await answerGemini(context, [entry(1, T)], 500)
+  const traffic = await answerGemini(context, [entry(1, T)], { homeStatus: 500 })
   await untilStoreOpen(serviceWorker)
   await configure(serviceWorker)
 
   const round = await crawl(serviceWorker)
+  expect(traffic.calls).toEqual(['GET /app'])
   expect(records(round.events)).toEqual([])
   expect(completions(round.events)).toEqual([[-1, [], 'Homepage fetch failed (status 500).']])
   expect(round.result).toEqual({ sitesCrawled: ['gemini'], issues: [{ url: HOME, message: `Unable to fetch ${HOME}. Status code = 500.` }] })
+})
+
+// The alarm starts a round every minute, and a pass can take longer. The
+// crawling flag, set when a crawl starts, is what keeps two passes from
+// running at once.
+test('a round that starts while the spider is still crawling skips it', async ({ context, serviceWorker }) => {
+  let reached: () => void = () => {}
+  const mainListAsked = new Promise<void>((resolve) => { reached = resolve })
+  let release: () => void = () => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const traffic = await answerGemini(context, [entry(1, T)], { beforeMain: () => { reached(); return held } })
+  await untilStoreOpen(serviceWorker)
+  await configure(serviceWorker)
+  await serviceWorker.evaluate(() => { self.eventRecorder.events = [] })
+
+  const round = () => serviceWorker.evaluate(() => new Promise((resolve) => {
+    self.rexCorePlugin.handleMessage({ messageType: 'beginBackgroundCrawls' }, null, resolve)
+  }))
+  const first = round()
+  await mainListAsked
+  const second = await round()
+  release()
+  expect(await first).toEqual({ sitesCrawled: ['gemini'], issues: [] })
+  expect(second).toEqual({ sitesCrawled: [], issues: [] })
+  expect(traffic.calls).toEqual(ONE_CRAWL)
+  const events = await serviceWorker.evaluate(() => self.eventRecorder.events)
+  expect(completions(events)).toEqual([[-1, [], '[gemini] Still crawling.'], [1, [chat(1)], 'Fetch successful.']])
 })
