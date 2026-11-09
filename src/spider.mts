@@ -1,12 +1,13 @@
 // The spider rex-spider runs for Gemini: its name, the URLs the extension
-// lets it reach, and a crawl that is one pass (src/pass.mts).
-// src/service-worker.mts makes the instance and registers it.
-import { dispatchEvent } from '@bric/rex-core/service-worker';
+// lets it reach, the served mode, and a crawl that is one pass
+// (src/pass.mts). src/service-worker.mts makes the instance and registers it.
+import rexCorePlugin, { dispatchEvent } from '@bric/rex-core/service-worker';
 import { REXSpider, type REXSpiderCrawlResult } from '@bric/rex-spider/service-worker';
 
 import { createClient } from './client.mts';
 import { HOME_URL, runPass } from './pass.mts';
 import { sleep } from './pacing.mts';
+import { createStore } from './store.mts';
 
 // A key nothing stores. Reading it is the cheap extension call that keeps the
 // worker awake through a wait or a slow call (src/pacing.mts).
@@ -16,6 +17,28 @@ const keepAlive = () => chrome.storage.local.get(KEEP_ALIVE_KEY);
 
 export class REXGeminiSpider extends REXSpider {
   client = createClient({ keepAlive });
+
+  // rex-core's store, for the mode record. Called through an arrow, so
+  // handleMessage keeps its this.
+  store = createStore((message, sender, sendResponse) => rexCorePlugin.handleMessage(message, sender, sendResponse));
+
+  // The served summarize setting as of the last config refresh: true is
+  // summary mode, absent or false is detail. rex-spider keeps a flag of its
+  // own that only ever turns on, so a config that turned summary off again
+  // would not take.
+  summarizes = false;
+
+  // rex-spider calls this on each refresh whose config has a block for this
+  // spider or a default one. With neither, the mode last served stays until
+  // the worker restarts, as enabled does.
+  updateConfiguration(configuration: Parameters<REXSpider['updateConfiguration']>[0]): void {
+    super.updateConfiguration(configuration);
+    this.summarizes = configuration.summarize === true;
+  }
+
+  justSummarize(): boolean {
+    return this.summarizes;
+  }
 
   fetchUrls(): string[] {
     return [];
@@ -80,6 +103,8 @@ export class REXGeminiSpider extends REXSpider {
     const outcome = await runPass({
       client: this.client,
       framework: this,
+      store: this.store,
+      now: () => Date.now(),
       // A shallow copy: rex-core's EventPayload has an index signature that
       // the record's interface does not.
       dispatch: (record) => dispatchEvent({ ...record }),

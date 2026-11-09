@@ -1,26 +1,33 @@
 // One crawl pass: the page token from the homepage, the chat list, and a
-// summary record for each chat in the crawl window whose upload key is not
-// stamped yet. Requests, rex-spider's side, the dispatch and the clock are
+// record for each chat in the crawl window that is not sent yet in the served
+// mode. Summary mode sends the list entry; detail mode reads the chat first.
+// Requests, rex-spider's side, the store, the dispatch and the clock are
 // handed in, so the pass runs under the unit tests as it does in the worker.
 // It never throws: every outcome is a reason.
 import type { DateString } from '@bric/rex-types/types';
 
-import { type Client } from './client.mts';
+import { type Answer, type Client } from './client.mts';
 import { uploadKeyId } from './keys.mts';
+import { type ListItem } from './list.mts';
+import { resendSince, sentAlready } from './mode.mts';
 import { TIMED_OUT, touch, withDeadline } from './pacing.mts';
+import { READ_RPC, type ReadResult, parseRead, readArgs } from './read.mts';
 import { DISABLED, FETCH_SUCCESSFUL, NO_RESULTS, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
-import { type GeminiRecord, buildSummaryRecord } from './record.mts';
+import { type GeminiRecord, buildDetailRecord, buildSummaryRecord } from './record.mts';
+import { type GeminiStore, type Mode } from './store.mts';
 import { type WalkStop, walkList } from './walk.mts';
-import { pageToken } from './wire.mts';
+import { bardErrorCodes, batchBody, batchUrl, pageToken } from './wire.mts';
 
 export const HOME_URL = 'https://gemini.google.com/app';
 
 // The rex-spider calls the pass makes. The window check reads the extension's
 // storage and the key calls rex-core's store, which never answers while its
 // database is not open, so each runs to a deadline. isEnabled is the served
-// config as of now, read before each request and each batch.
+// config as of now, read before each request and each batch; justSummarize
+// is the served mode, read once per pass.
 export interface PassFramework {
   isEnabled(): boolean;
+  justSummarize(): boolean;
   crawlWindowContains(timestamp: number): Promise<boolean>;
   checkIfAlreadyTransmitted(identifier: string, updated: DateString): Promise<boolean>;
   logTransmitted(identifier: string, updated: DateString): Promise<void>;
@@ -42,13 +49,22 @@ export interface PassLimits {
   // that only storage that is not answering trips it, as the other REX
   // spiders' passes allow.
   readonly storeMs: number;
+  // The longest the detail reads of one pass may take, waits included.
+  // rex-spider runs its spiders one at a time, so a pass with hundreds of
+  // chats to read would hold the others back for hours. The chats it does not
+  // reach keep no key and are read in a later pass.
+  readonly detailBudgetMs: number;
 }
 
-export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000 };
+export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000 };
 
 export interface PassDeps {
   readonly client: Pick<Client, 'get' | 'postForm'>;
   readonly framework: PassFramework;
+  // rex-core's store, for the mode record (mode.mts).
+  readonly store: Pick<GeminiStore, 'mode'>;
+  // Epoch ms.
+  readonly now: () => number;
   readonly dispatch: (record: GeminiRecord) => void;
   readonly sleep: (ms: number) => Promise<void>;
   readonly keepAlive: () => unknown;
@@ -110,6 +126,150 @@ function stopReason(stop: WalkStop, inWindow: number): string | null {
   }
 }
 
+// What the sending of a pass shares.
+interface Sending {
+  readonly deps: PassDeps;
+  readonly limits: PassLimits;
+  readonly log: (line: string) => void;
+  // The page token.
+  readonly at: string;
+}
+
+interface Sent {
+  readonly sent: number;
+  readonly disabled: boolean;
+}
+
+const kindOf = (error: unknown) => (error instanceof Error ? error.name : typeof error);
+
+function dispatched(ctx: Sending, record: GeminiRecord): boolean {
+  try {
+    ctx.deps.dispatch(record);
+    return true;
+  } catch (error) {
+    ctx.log(`a record could not be dispatched (${kindOf(error)})`);
+    return false;
+  }
+}
+
+// Stamps a sent record's key, in the record's own mode, and reads it back:
+// rex-spider's logTransmitted resolves whatever the store answers, a failed
+// write included. A stamp that fails, is not kept, or gets no answer stops
+// the stamping and the sending for the pass: the store is failing, and a
+// silent one would hold each further stamp for its whole deadline. A record
+// sent but not stamped, the rest of a summary batch included, goes out again
+// in a later pass, so none is lost. The records already sent stay counted.
+async function stamped(ctx: Sending, record: GeminiRecord): Promise<boolean> {
+  const { framework, keepAlive } = ctx.deps;
+  const id = uploadKeyId(record.identifier, record.is_summary);
+  try {
+    await step(() => framework.logTransmitted(id, record.ended), ctx.limits.storeMs, keepAlive, ctx.log);
+    if (!(await step(() => framework.checkIfAlreadyTransmitted(id, record.ended), ctx.limits.storeMs, keepAlive, ctx.log))) {
+      ctx.log('a stamp was not kept; sending stops for this pass');
+      return false;
+    }
+    return true;
+  } catch (error) {
+    ctx.log(`a stamp ${error instanceof StoreSilent ? 'got no answer' : `failed (${kindOf(error)})`}; sending stops for this pass`);
+    return false;
+  }
+}
+
+// Summary mode: the records in batches, each batch's keys stamped after the
+// settle wait that follows it.
+async function sendSummaries(ctx: Sending, records: readonly GeminiRecord[]): Promise<Sent> {
+  let sent = 0;
+  for (let start = 0; start < records.length; start += ctx.limits.batch) {
+    if (!ctx.deps.framework.isEnabled()) {
+      return { sent, disabled: true };
+    }
+    const batch: GeminiRecord[] = [];
+    for (const record of records.slice(start, start + ctx.limits.batch)) {
+      if (dispatched(ctx, record)) {
+        batch.push(record);
+      }
+    }
+    sent += batch.length;
+    await ctx.deps.sleep(ctx.limits.settleMs);
+    for (const record of batch) {
+      if (!(await stamped(ctx, record))) {
+        return { sent, disabled: false };
+      }
+    }
+  }
+  return { sent, disabled: false };
+}
+
+// crawl_delay as a wait. A value that is not a positive number is no wait, as
+// a bare timer takes it; the reads still keep the settle wait between them.
+function paceMs(framework: PassFramework): number {
+  const delay = Number(framework.fetchCrawlDelay());
+  return Number.isFinite(delay) && delay > 0 ? delay : 0;
+}
+
+// What went wrong with a read, for the log, never the answer's text.
+function readFailure(answer: Answer, read: Exclude<ReadResult, { kind: 'read' }> | null): string {
+  if (answer.kind !== 'ok') {
+    return answer.kind;
+  }
+  if (read === null) {
+    return `status ${answer.status}`;
+  }
+  return read.kind === 'error' ? `error frame, code ${read.code}` : 'not a read';
+}
+
+// Detail mode: each chat read in turn, crawl_delay apart and never closer
+// than the settle wait, until the detail budget is spent. The floor keeps a
+// served crawl_delay of 0, or one that is not a number, from firing reads
+// back to back. A record's key is stamped after the wait before the next
+// read, or after a settle wait at the end. A failed read sends and stamps
+// nothing for its chat, so a later pass reads it again.
+async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
+  const { deps, limits, log } = ctx;
+  const { client, framework } = deps;
+  const started = deps.now();
+  let sent = 0;
+  // The record sent last, its key not stamped yet.
+  let unstamped: GeminiRecord | null = null;
+  for (const item of items) {
+    if (deps.now() - started >= limits.detailBudgetMs) {
+      log('the detail budget is spent; the chats not read are read in a later pass');
+      break;
+    }
+    await deps.sleep(Math.max(paceMs(framework), limits.settleMs));
+    if (unstamped !== null) {
+      const record: GeminiRecord = unstamped;
+      unstamped = null;
+      if (!(await stamped(ctx, record))) {
+        return { sent, disabled: false };
+      }
+    }
+    if (!framework.isEnabled()) {
+      return { sent, disabled: true };
+    }
+    const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), ctx.at));
+    const read = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseRead(answer.text, item.id) : null;
+    if (read !== null && read.kind === 'read') {
+      const record = buildDetailRecord(item, read);
+      if (dispatched(ctx, record)) {
+        sent += 1;
+        unstamped = record;
+      }
+      continue;
+    }
+    if (answer.kind === 'ok' && bardErrorCodes(answer.text).includes(1096)) {
+      log('the session expired during the detail reads; the chats not read are read in a later pass');
+      break;
+    }
+    log(`a detail read failed (${readFailure(answer, read)})`);
+  }
+  if (unstamped !== null) {
+    await deps.sleep(limits.settleMs);
+    await stamped(ctx, unstamped);
+  }
+  return { sent, disabled: false };
+}
+
 export async function runPass(deps: PassDeps): Promise<PassOutcome> {
   const { client, framework, limits = PASS_LIMITS, log = (line: string) => console.log(`[rex-spider-gemini] ${line}`) } = deps;
   try {
@@ -118,6 +278,24 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (!framework.isEnabled()) {
       return SWITCHED_OFF;
     }
+    // Read once: a config refresh during the pass applies from the next one.
+    const served: Mode = framework.justSummarize() ? 'summary' : 'detail';
+    // When this browser started running the served mode, recorded now if it
+    // had not run it before (mode.mts). Each store call follows a keep-alive
+    // call, as every store call of a pass does.
+    const since = await resendSince({
+      mode: {
+        get: () => {
+          touch(deps.keepAlive, log);
+          return deps.store.mode.get();
+        },
+        set: (record) => {
+          touch(deps.keepAlive, log);
+          return deps.store.mode.set(record);
+        },
+      },
+    }, served, deps.now());
+
     const home = await client.get(HOME_URL);
     if (home.kind !== 'ok') {
       return failed(homepageUnreachable(home.kind));
@@ -133,17 +311,18 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at, requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
 
     const crawledIds: string[] = [];
-    const unsent: GeminiRecord[] = [];
+    const unsent: ListItem[] = [];
+    const transmitted = (id: string, ended: DateString) => step(() => framework.checkIfAlreadyTransmitted(id, ended), limits.storeMs, deps.keepAlive, log);
     const stopsBeforeSending = walk.stop !== null && ['not-a-list', 'timeout', 'network', 'disabled'].includes(walk.stop.kind);
     if (!stopsBeforeSending) {
       for (const item of walk.items) {
-        const record = buildSummaryRecord(item);
-        if (!(await step(() => framework.crawlWindowContains(record.ended.timestamp()), limits.storeMs, deps.keepAlive, log))) {
+        const { ended } = buildSummaryRecord(item);
+        if (!(await step(() => framework.crawlWindowContains(ended.timestamp()), limits.storeMs, deps.keepAlive, log))) {
           continue;
         }
         crawledIds.push(item.id);
-        if (!(await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), record.ended), limits.storeMs, deps.keepAlive, log))) {
-          unsent.push(record);
+        if (!(await sentAlready(item.id, ended, served, since, transmitted))) {
+          unsent.push(item);
         }
       }
     }
@@ -161,45 +340,14 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     }
 
     // Newest first, so a pass cut short has sent the most recent chats.
-    unsent.sort((a, b) => b.ended.timestamp() - a.ended.timestamp());
-    let sent = 0;
-    let stampsStopped = false;
-    let disabled = false;
-    for (let start = 0; start < unsent.length && !stampsStopped; start += limits.batch) {
-      if (!framework.isEnabled()) {
-        disabled = true;
-        break;
-      }
-      const batch: GeminiRecord[] = [];
-      for (const record of unsent.slice(start, start + limits.batch)) {
-        try {
-          deps.dispatch(record);
-          batch.push(record);
-          sent += 1;
-        } catch (error) {
-          log(`a record could not be dispatched (${error instanceof Error ? error.name : typeof error})`);
-        }
-      }
-      await deps.sleep(limits.settleMs);
-      for (const record of batch) {
-        if (stampsStopped) {
-          break;
-        }
-        // A stamp that fails, or gets no answer, stops the stamping and the
-        // sending: records sent from here on could not be stamped either, so
-        // none are, and they go out next pass instead of twice. The records
-        // already sent stay counted.
-        try {
-          await step(() => framework.logTransmitted(uploadKeyId(record.identifier, true), record.ended), limits.storeMs, deps.keepAlive, log);
-        } catch (error) {
-          log(`a stamp ${error instanceof StoreSilent ? 'got no answer' : `failed (${error instanceof Error ? error.name : typeof error})`}; sending stops for this pass`);
-          stampsStopped = true;
-        }
-      }
-    }
+    unsent.sort((a, b) => b.endedSec - a.endedSec);
+    const ctx: Sending = { deps, limits, log, at };
+    const { sent, disabled } = served === 'summary'
+      ? await sendSummaries(ctx, unsent.map((item) => buildSummaryRecord(item)))
+      : await sendDetails(ctx, unsent);
     // The reason says how the list was read; how much went out is the count.
     // A pass that read the whole list says "Fetch successful." even when its
-    // sending stopped early: what it did not send goes out next pass. A
+    // sending stopped early: what it did not send goes out in a later pass. A
     // switch-off says so instead, whatever was read, so nothing counts a pass
     // the config stopped as a full listing.
     if (disabled) {
@@ -210,7 +358,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (error instanceof StoreSilent) {
       return failed(STORE_SILENT);
     }
-    const kind = error instanceof Error ? error.name : typeof error;
+    const kind = kindOf(error);
     log(`the pass ended on an internal error (${kind})`);
     return failed(listFailed(`internal error (${kind})`));
   }
