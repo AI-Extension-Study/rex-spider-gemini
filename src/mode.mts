@@ -14,8 +14,14 @@ import { type GeminiStore, type Mode } from './store.mts';
 
 export const RESEND_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
 
+// A stored start further ahead of now than this was written under a clock
+// that ran fast. Trusted, it would shrink the re-send, possibly to nothing, so
+// it is replaced by now. A clock that ran slow cannot be told apart from a
+// real early start and is trusted.
+export const CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
+
 // When this browser started running the served mode, writing the record when
-// the stored one is absent, malformed or of the other mode. Null when the
+// the stored one is absent, malformed, of the other mode or from the future. Null when the
 // record could not be read or a new one could not be written: this pass then
 // sends nothing again (sentAlready), and the next pass tries again.
 export async function resendSince(store: Pick<GeminiStore, 'mode'>, served: Mode, now: number): Promise<number | null> {
@@ -23,7 +29,7 @@ export async function resendSince(store: Pick<GeminiStore, 'mode'>, served: Mode
   if (stored.unanswered) {
     return null;
   }
-  if (stored.value !== null && stored.value.mode === served) {
+  if (stored.value !== null && stored.value.mode === served && stored.value.since <= now + CLOCK_SKEW_MS) {
     return stored.value.since;
   }
   const written = await store.mode.set({ mode: served, since: now });

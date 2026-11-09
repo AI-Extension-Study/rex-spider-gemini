@@ -51,6 +51,15 @@ test('a record of the other mode, or a malformed one, is replaced by the served 
   }
 });
 
+test('a start more than a day ahead of now, written under a clock that ran fast, is replaced by now', async () => {
+  const fake = modeStore(read({ mode: 'detail', since: SWITCH + 365 * DAY }));
+  assert.equal(await resendSince(fake.store, 'detail', SWITCH), SWITCH);
+  assert.deepEqual(fake.writes, [{ mode: 'detail', since: SWITCH }]);
+  const close = modeStore(read({ mode: 'detail', since: SWITCH + DAY }));
+  assert.equal(await resendSince(close.store, 'detail', SWITCH), SWITCH + DAY);
+  assert.deepEqual(close.writes, []);
+});
+
 test('a record that could not be read, or a new one that could not be written, gives no start this pass', async () => {
   const unread = modeStore(read(null, { unanswered: true }));
   assert.equal(await resendSince(unread.store, 'detail', SWITCH), null);
@@ -95,6 +104,11 @@ test('the rule runs both ways: back to summary, a detail-mode chat from the last
   const ended = SWITCH - 3 * DAY;
   assert.equal(await sentAlready('c_1', at(ended), 'summary', SWITCH, keys(['c_1-detail', ended])), false);
   assert.equal(await sentAlready('c_1', at(ended), 'summary', SWITCH, keys(['c_1', ended])), true);
+});
+
+test('back to summary, a chat whose detail record is from more than 90 days before the switch keeps it', async () => {
+  const ended = SWITCH - 90 * DAY - 1000;
+  assert.equal(await sentAlready('c_1', at(ended), 'summary', SWITCH, keys(['c_1-detail', ended])), true);
 });
 
 test('with no start this pass, a chat sent in the other mode is held back, not sent', async () => {
