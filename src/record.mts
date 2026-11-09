@@ -76,7 +76,11 @@ const turnOf = (exchange: Exchange): GeminiTurn => ({
 export function buildDetailRecord(item: ListItem, read: Extract<ReadResult, { kind: 'read' }>): GeminiRecord {
   const summary = buildSummaryRecord(item);
   const oldestFirst = [...read.exchanges].reverse().sort((a, b) => a.whenSec - b.whenSec || a.whenNanos - b.whenNanos);
-  const started = read.whole && oldestFirst.length > 0 ? new DateString(oldestFirst[0].whenSec) : undefined;
+  // A start after the listed end means the chat changed between the list
+  // call and the read: the list's time is stale, and a start after it would
+  // make the record inconsistent, so it is left out.
+  const oldest = oldestFirst.length > 0 ? oldestFirst[0] : undefined;
+  const started = read.whole && oldest !== undefined && oldest.whenSec <= item.endedSec ? new DateString(oldest.whenSec) : undefined;
   return {
     ...summary,
     is_summary: false,

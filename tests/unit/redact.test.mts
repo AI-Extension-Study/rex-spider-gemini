@@ -4,11 +4,11 @@ import { test } from 'node:test';
 
 import { DateString } from '@bric/rex-types/types';
 
-import { type ListItem } from '../../src/list.mts';
+import { type ListItem, parseListPage } from '../../src/list.mts';
 import { ATTACHMENT_TYPES, parseRead } from '../../src/read.mts';
 import { type GeminiRecord, buildDetailRecord, buildSummaryRecord } from '../../src/record.mts';
 import { ATTACHMENT_KINDS, redactGemini } from '../../src/redact.mts';
-import { chatId } from './batch.mts';
+import { batchResponse, chatId, listEntry, wrb } from './batch.mts';
 import { MARKER, draftId, exchange, readResponse } from './exchanges.mts';
 
 const T = 1700000000;
@@ -72,22 +72,23 @@ test('no text gets through: an extra key, or text in a turn field or a list posi
   metadata[2] = `c_${MARKER}`;
   metadata[3] = MARKER;
   metadata[4] = { text: MARKER };
-  metadata[6] = [MARKER];
-  metadata[7] = [[1, 2]];
+  metadata[6] = [MARKER, 3];
+  metadata[7] = [[1, MARKER]];
   const loaded = {
     ...record,
     title: MARKER,
     extra: { text: MARKER },
-    turns: record.turns.map((turn) => ({ ...turn, text: MARKER, when: MARKER, attachment_types: [MARKER, 'image/png'] })),
+    turns: [...record.turns.map((turn) => ({ ...turn, text: MARKER, when: MARKER, attachment_types: [MARKER, 'image/png'] })), MARKER, [MARKER]],
     metadata,
   };
   const out = await redactGemini(loaded, hash);
   assert.equal(JSON.stringify(out).includes(MARKER), false, JSON.stringify(out));
   assert.equal(out.is_summary, false, 'a record with extra text was not kept as a record');
   const turns = out.turns as Record<string, unknown>[];
+  assert.equal(turns.length, 2, 'a turn that is not an object was kept');
   assert.deepEqual(Object.keys(turns[0]), ['identifier', 'parent', 'when', 'drafts', 'attachments', 'attachment_types']);
   assert.deepEqual([turns[0].when, turns[0].attachment_types], [null, ['other', 'image/png']]);
-  assert.deepEqual((out.metadata as unknown[]).slice(2, 8), [null, null, null, [T, 457522000], null, null]);
+  assert.deepEqual((out.metadata as unknown[]).slice(2, 8), [null, null, null, [T, 457522000], [null, 3], [[1, null]]]);
 });
 
 test('a point that is not a record this module builds keeps only the scaffold', async () => {
@@ -102,11 +103,16 @@ test('a point that is not a record this module builds keeps only the scaffold', 
     ['a summary with a turn', { ...summary, turns: [{ identifier: 'r_0000000000000001' }] }, scaffold],
     ['no metadata', { ...summary, metadata: undefined }, scaffold],
     ['metadata of another chat', { ...summary, metadata: entry(2) }, scaffold],
-    ['ended at another time than the list entry', { ...summary, ended: new DateString(T + 1) }, scaffold],
+    // Each case below keeps date in step with the field it breaks, so only that field's check can turn it away.
+    ['ended at another time than the list entry', { ...summary, ended: new DateString(T + 1), date: (T + 1) * 1000 }, { ...scaffold, date: (T + 1) * 1000 }],
     ['ended as a string', { ...summary, ended: '2023-11-14T22:13:20Z' }, scaffold],
     ['ended from an ISO string', { ...summary, ended: new DateString('2023-11-14T22:13:20Z') }, scaffold],
+    ['ended whose originalValue is not number:', { ...summary, ended: { value: '2023-11-14T22:13:20Z', originalValue: `text ${T}` } }, scaffold],
+    ['ended whose value only looks like an instant', { ...summary, ended: { value: { toString: () => '2023-11-14T22:13:20Z' }, originalValue: `number:${T}` } }, scaffold],
+    ['ended whose value is another string', { ...summary, ended: { value: 'not an instant', originalValue: `number:${T}` } }, scaffold],
+    ['ended with another own key', { ...summary, ended: Object.assign(new DateString(T), { note: 'x' }) }, scaffold],
     ['a date that is not the record\'s', { ...summary, date: T * 1000 + 1 }, { ...scaffold, date: T * 1000 + 1 }],
-    ['a start on a summary', { ...summary, started: new DateString(T - 60) }, scaffold],
+    ['a start on a summary', { ...summary, started: new DateString(T - 60), date: (T - 60) * 1000 }, { ...scaffold, date: (T - 60) * 1000 }],
   ];
   const record = detail(1);
   cases.push(['a start after the end', { ...record, started: new DateString(T + 60), date: (T + 60) * 1000 }, { ...scaffold, date: (T + 60) * 1000 }]);
@@ -118,6 +124,10 @@ test('a point that is not a record this module builds keeps only the scaffold', 
 test('the scaffold keeps each field only in its form', async () => {
   const event = { name: 'Rex Conversation', platform: 'gemini', identifier: MARKER, date: 'today', generatorId: 'gen-1', _pdk_trace_context: { id: 1 }, 'passive-data-metadata': { source: 2 }, title: MARKER };
   assert.deepEqual(await redactGemini(event, hash), { platform: 'gemini', generatorId: 'gen-1', _pdk_trace_context: { id: 1 }, 'passive-data-metadata': { source: 2 } });
+  const text = { name: 'rex-conversation', platform: MARKER, generatorId: MARKER, date: 1 };
+  assert.deepEqual(await redactGemini(text, hash), { name: 'rex-conversation', date: 1 }, 'a platform or generator id with text');
+  const record = { ...buildSummaryRecord(item(1)), generatorId: MARKER };
+  assert.equal(JSON.stringify(await redactGemini(record, hash)).includes(MARKER), false, 'a record with text in its generator id');
 });
 
 test('a record keeps the PDK fields it came with', async () => {
@@ -141,9 +151,10 @@ test('it never rejects: a field that throws, a hash that rejects, or something t
 });
 
 test('a title hash that is not a SHA-256 hex digest is kept as null', async () => {
-  for (const bad of [async () => MARKER, async () => null, async () => 'ABCDEF'.repeat(11).slice(0, 64)]) {
+  const cases: [string, () => Promise<string | null>][] = [['text', async () => MARKER], ['null', async () => null], ['upper-case hex', async () => 'ABCDEF'.repeat(11).slice(0, 64)]];
+  for (const [what, bad] of cases) {
     const out = await redactGemini(buildSummaryRecord(item(1)), bad);
-    assert.equal((out.metadata as unknown[])[1], null);
+    assert.equal((out.metadata as unknown[])[1], null, what);
   }
 });
 
@@ -155,4 +166,55 @@ test('a DateString whose instant is held as its ISO string still reads as the re
 
 test('the attachment kinds a turn may name are the read parser\'s, and other', () => {
   assert.deepEqual([...ATTACHMENT_KINDS].sort(), [...ATTACHMENT_TYPES, 'other'].sort());
+});
+
+test('each turn field is kept only in its form', async () => {
+  const record = detail(1) as unknown as Record<string, unknown> & { turns: Record<string, unknown>[] };
+  const odd = { identifier: MARKER, parent: `r_${MARKER}`, when: '2023-11-14T22:13:20Z', drafts: -1, attachments: 1.5, attachment_types: 'image/png' };
+  const out = await redactGemini({ ...record, turns: [odd, record.turns[1]] }, hash);
+  assert.deepEqual((out.turns as unknown[])[0], { identifier: null, parent: null, when: '2023-11-14T22:13:20Z', drafts: null, attachments: null, attachment_types: [] });
+});
+
+test('records of every shape the builders make come back as they went in', async () => {
+  const cases: [string, GeminiRecord][] = [];
+  // A reply with no draft list, so drafts is null.
+  const read = parseRead(readResponse([exchange({ chat: chatId(1), response: 1, seconds: T - 60, nanos: 0 })]), chatId(1));
+  assert.equal(read.kind, 'read', 'Test setup invalid: the read did not parse');
+  const noDrafts = read as Extract<typeof read, { kind: 'read' }>;
+  cases.push(['drafts null, and a time with no nanoseconds', buildDetailRecord(item(1), { ...noDrafts, exchanges: noDrafts.exchanges.map((exchanged) => ({ ...exchanged, drafts: null })) })]);
+  cases.push(['the ten-position list entry', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: listEntry(1, T) })]);
+  const sparse = entry(1);
+  delete sparse[3];
+  cases.push(['a list entry with a hole', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: sparse })]);
+  const fraction = entry(1, T + 0.5);
+  cases.push(['seconds with a fraction', buildSummaryRecord({ id: chatId(1), endedSec: T + 0.5, entry: fraction })]);
+  const marked = entry(1);
+  marked[2] = '0123456789abcdef';
+  marked[3] = 'g_0123456789abcdef';
+  marked[4] = [[T, 0], [T + 1, 5]];
+  marked[6] = true;
+  cases.push(['list positions holding a bare or prefixed hex id, nested times and a flag', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked })]);
+  for (const [what, record] of cases) {
+    const out = await redactGemini(record, hash);
+    const expected = plain(record);
+    expected.metadata[1] = await hash('Title 1');
+    assert.deepEqual(plain(out), expected, what);
+  }
+});
+
+test('a chat the list parser gives always reads as a record', async () => {
+  const page = parseListPage(batchResponse(wrb('MaZiqc', [null, null, [entry(1), listEntry(2, T)]])));
+  assert.ok(page.kind === 'page' && page.items.length === 2, 'Test setup invalid: the page did not parse');
+  for (const listed of page.items) {
+    assert.equal((await redactGemini(buildSummaryRecord(listed), hash)).is_summary, true, listed.id);
+  }
+});
+
+test('a string at a list position is kept only as a hex id, whatever its prefix', async () => {
+  for (const [value, kept] of [['0123456789abcdef', true], ['gem_0123456789abcdef', true], ['0123456789ABCDEF', false], ['abc-DEF_123', false], ['deadbee', false], ['writer_0123456789abcdef', false]] as const) {
+    const marked = entry(1);
+    marked[2] = value;
+    const out = await redactGemini(buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked }), hash);
+    assert.equal((out.metadata as unknown[])[2], kept ? value : null, value);
+  }
 });

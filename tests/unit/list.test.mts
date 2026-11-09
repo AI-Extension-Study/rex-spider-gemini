@@ -105,3 +105,9 @@ test('an entry whose time is outside 2001 to 2286, such as one in milliseconds, 
     assert.deepEqual(page.kind === 'page' ? [page.items.map((item) => item.id), page.skipped] : page, [[chatId(1)], 1], String(seconds));
   }
 });
+
+test('an entry whose id is not c_ and lowercase hex is skipped and counted, so no record of it is cut down by the redactor', () => {
+  const odd = ['c_0123456789ABCDEF', 'chat one', 'c_', 'r_0000000000000001'].map((id) => [id, 'Title', null, null, null, [1700000000, 0]]);
+  const page = parseListPage(batchResponse(wrb('MaZiqc', [null, null, [...odd, listEntry(1, 1700000000)]])));
+  assert.deepEqual(page.kind === 'page' ? [page.items.map((listed) => listed.id), page.skipped] : page, [[chatId(1)], 4]);
+});

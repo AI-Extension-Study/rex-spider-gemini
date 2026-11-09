@@ -116,3 +116,9 @@ test('when keeps a nanosecond value below 0.1 s exactly', () => {
   const tiny = read(readResponse([exchange({ chat: CHAT, response: 1, seconds: 1700000100, nanos: 5000 })]));
   assert.equal(buildDetailRecord(item, tiny).turns[0].when, '2023-11-14T22:15:00.000005Z');
 });
+
+test('a start after the listed end is left out, and the record is dated by its last message', () => {
+  // The chat changed between the list call and its read: its oldest exchange is newer than the time the list gave.
+  const record = buildDetailRecord(item, read(readResponse([exchange({ chat: CHAT, response: 1, seconds: 1700000305 })])));
+  assert.deepEqual(['started' in record, record.date], [false, 1700000300 * 1000]);
+});

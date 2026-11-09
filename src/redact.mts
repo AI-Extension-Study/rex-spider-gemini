@@ -17,8 +17,7 @@ const PLATFORM = 'gemini';
 // length is left open, so a longer id still reads; hex carries no text.
 const CHAT_ID = /^c_[0-9a-f]{8,64}$/;
 const RESPONSE_ID = /^r_[0-9a-f]{8,64}$/;
-const DRAFT_ID = /^rc_[0-9a-f]{8,64}$/;
-const isChatId = (value: unknown): value is string => typeof value === 'string' && CHAT_ID.test(value);
+export const isChatId = (value: unknown): value is string => typeof value === 'string' && CHAT_ID.test(value);
 const isResponseId = (value: unknown): value is string => typeof value === 'string' && RESPONSE_ID.test(value);
 
 // The form the scaffold keeps a name, a platform or a generator id in: PDK's
@@ -79,7 +78,7 @@ function readOwn(event: unknown, key: string): unknown {
 // its own instants.
 const INSTANT_TO_STRING = (Object.getPrototypeOf(new DateString('1970-01-01T00:00:00Z').value) as { toString(): string }).toString;
 
-const NUMBER_FORM = /^number:(\d+)$/;
+const NUMBER_FORM = /^number:(\d+(?:\.\d+)?)$/;
 
 // The seconds a started or ended holds, when it is the DateString record.mts
 // builds from whole seconds: originalValue 'number:' and those seconds (the
@@ -110,10 +109,16 @@ function secondsOf(date: unknown, expected: number | null): number | null {
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
+// A string a list position may keep: lowercase hex of 8 or more digits, bare
+// or after a short lowercase prefix, the form every id seen so far takes.
+// No word or sentence has that form.
+const HEX_ID = /^(?:[a-z]{1,4}_)?[0-9a-f]{8,64}$/;
+
 // A list-entry position kept as it is, when it can hold no text: null, a
-// flag, a finite number, an id, or a list of numbers such as [seconds,
-// nanos]. Anything else is null, so the entry keeps its positions.
-function keepPosition(value: unknown): unknown {
+// flag, a finite number, a hex id, or a list of those, such as [seconds,
+// nanos], to three levels. Anything else is null, so the entry keeps its
+// positions: an object, or a string that is not a hex id.
+function keepPosition(value: unknown, depth = 0): unknown {
   if (value === null || typeof value === 'boolean') {
     return value;
   }
@@ -121,10 +126,10 @@ function keepPosition(value: unknown): unknown {
     return Number.isFinite(value) ? value : null;
   }
   if (typeof value === 'string') {
-    return CHAT_ID.test(value) || RESPONSE_ID.test(value) || DRAFT_ID.test(value) ? value : null;
+    return HEX_ID.test(value) ? value : null;
   }
-  if (Array.isArray(value) && value.every((element) => element === null || (typeof element === 'number' && Number.isFinite(element)))) {
-    return [...value];
+  if (Array.isArray(value) && depth < 3) {
+    return Array.from(value, (element) => keepPosition(element, depth + 1));
   }
   return null;
 }

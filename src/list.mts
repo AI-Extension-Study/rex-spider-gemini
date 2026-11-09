@@ -3,6 +3,7 @@ import { type Conversation, DateString } from '@bric/rex-types/types';
 
 import { isPlausibleSeconds } from './time.mts';
 import { rpcFrames } from './wire.mts';
+import { isChatId } from './redact.mts';
 
 export const LIST_RPC = 'MaZiqc';
 
@@ -21,8 +22,11 @@ export type ListPage =
   | { readonly kind: 'error'; readonly code: number | null }
   | { readonly kind: 'not-a-list' };
 
+// A chat id is read only in the form the redactor keeps (redact.mts): a chat
+// with any other id is skipped and counted, so the pass says it was partial,
+// rather than sent as a record the extension cuts down to its scaffold.
 function readItem(chat: unknown): ListItem | null {
-  if (!Array.isArray(chat) || typeof chat[0] !== 'string' || chat[0] === '') {
+  if (!Array.isArray(chat) || !isChatId(chat[0])) {
     return null;
   }
   const time = chat[5];
