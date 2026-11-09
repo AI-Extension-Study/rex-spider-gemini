@@ -9,7 +9,7 @@ import type { DateString } from '@bric/rex-types/types';
 import { type Answer, type Client } from './client.mts';
 import { uploadKeyId } from './keys.mts';
 import { type ListItem } from './list.mts';
-import { resendSince, sentAlready } from './mode.mts';
+import { CLOCK_SKEW_MS, resendSince, sentAlready } from './mode.mts';
 import { TIMED_OUT, touch, withDeadline } from './pacing.mts';
 import { READ_RPC, type ReadResult, parseRead, readArgs } from './read.mts';
 import { DETAIL_FAILED, DISABLED, FETCH_SUCCESSFUL, NO_RESULTS, NO_TOKEN, PARTIAL, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
@@ -266,7 +266,12 @@ const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 
 // retry time. The summary's key is not stamped: a chat last used before the
 // re-send window would then count as sent in detail (mode.mts), and its
 // retry would never come. With halt_on_error the first failed read ends the
-// reads; without, failedRun of them in a row do.
+// reads; without, failedRun first failures in a row do. A chat that fails
+// again says nothing about the next one, so it does not count.
+//
+// A rate limit (429) or an overloaded server (503) asks for a wait: the
+// reads end, and the chat is read in a later pass with no memo and no
+// summary. So does an expired session.
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
   const { client, framework, store } = deps;
@@ -289,7 +294,9 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       continue;
     }
     const earlier = memo.value !== null && memo.value.ended === endedMs ? memo.value : null;
-    if (earlier !== null && deps.now() < earlier.at + earlier.retryMs) {
+    // A memo from a clock that ran fast is not trusted, as the mode record's
+    // start is not (mode.mts).
+    if (earlier !== null && earlier.at <= deps.now() + CLOCK_SKEW_MS && deps.now() < earlier.at + earlier.retryMs) {
       continue;
     }
     await deps.sleep(Math.max(paceMs(framework), limits.settleMs));
@@ -322,27 +329,40 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       log('the session expired during the detail reads; the chats not read are read in a later pass');
       break;
     }
+    if (answer.kind === 'ok' && (answer.status === 429 || answer.status === 503)) {
+      log(`a detail read was answered ${answer.status}; the chats not read are read in a later pass`);
+      break;
+    }
     log(`a detail read failed (${readFailure(answer, read)})`);
-    failedInARow += 1;
     const failures = (earlier?.failures ?? 0) + 1;
+    if (failures === 1) {
+      failedInARow += 1;
+    }
+    let memoDue = true;
     if (failures === 1) {
       const summary = buildSummaryRecord(item);
       let sentBefore: boolean;
       try {
         sentBefore = await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), summary.ended), limits.storeMs, deps.keepAlive, log);
       } catch (error) {
-        if (!(error instanceof StoreSilent)) {
-          throw error;
-        }
-        log('a key read got no answer; sending stops for this pass');
+        log(`a key read ${error instanceof StoreSilent ? 'got no answer' : `failed (${kindOf(error)})`}; sending stops for this pass`);
         return { sent, disabled: false, failedReads: false };
       }
-      if (!sentBefore && dispatched(ctx, summary)) {
-        sent += 1;
+      if (!sentBefore) {
+        if (dispatched(ctx, summary)) {
+          sent += 1;
+        } else {
+          // No memo, so a later pass reads the chat at once and sends the
+          // summary then. A memo now would make each later failure a repeat,
+          // and this last message would never be sent.
+          memoDue = false;
+        }
       }
     }
-    const mayPass = answer.kind !== 'ok' || answer.status >= 500;
-    pending = { kind: 'memo', chatId: item.id, memo: { ended: endedMs, at: deps.now(), retryMs: mayPass && failures === 1 ? RETRY_SOON_MS : RETRY_LATE_MS, failures } };
+    if (memoDue) {
+      const mayPass = answer.kind !== 'ok' || answer.status >= 500;
+      pending = { kind: 'memo', chatId: item.id, memo: { ended: endedMs, at: deps.now(), retryMs: mayPass && failures === 1 ? RETRY_SOON_MS : RETRY_LATE_MS, failures } };
+    }
     if (halts || failedInARow >= limits.failedRun) {
       log(halts ? 'a detail read failed and halt_on_error is set; the reads stop' : `${failedInARow} detail reads failed in a row; the reads stop`);
       failedReads = true;
@@ -440,9 +460,10 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
       return { crawledCount: sent, crawledIds, reason: DISABLED, issue: null };
     }
     // Failed reads say so too: the list was read, but the chats in it were
-    // not, and a reader of the data should see that.
+    // not, and a reader of the data should see that. A list read only in
+    // part says so first, since the ids are then not the whole list.
     if (failedReads) {
-      return { crawledCount: sent, crawledIds, reason: DETAIL_FAILED, issue: DETAIL_FAILED };
+      return { crawledCount: sent, crawledIds, reason: walk.complete ? DETAIL_FAILED : PARTIAL, issue: DETAIL_FAILED };
     }
     return { crawledCount: sent, crawledIds, reason: walk.complete ? FETCH_SUCCESSFUL : PARTIAL, issue: null };
   } catch (error) {

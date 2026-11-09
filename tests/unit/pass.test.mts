@@ -96,8 +96,9 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
 
 // rex-core's store as the pass sees it (store.mts): the mode record and the
 // memos of failed reads. unanswered: mode reads get no answer;
-// memoUnanswered: memo reads get none; memoUnkept: memo writes fail.
-function fakeStore({ stored = null as ModeRecord | null, unanswered = false, memos = {} as Record<string, DetailMemo>, memoUnanswered = false, memoUnkept = false } = {}) {
+// memoUnanswered: memo reads get none; memoUnkept: memo writes fail;
+// malformed: chats whose memo holds something that is not a memo.
+function fakeStore({ stored = null as ModeRecord | null, unanswered = false, memos = {} as Record<string, DetailMemo>, memoUnanswered = false, memoUnkept = false, malformed = [] as string[] } = {}) {
   let value = stored;
   const writes: ModeRecord[] = [];
   const book = new Map(Object.entries(memos));
@@ -109,6 +110,7 @@ function fakeStore({ stored = null as ModeRecord | null, unanswered = false, mem
     memo: {
       get: async (chatId: string) => {
         counts.memoGets += 1;
+        if (malformed.includes(chatId)) return { value: null, unanswered: false, malformed: true };
         return { value: memoUnanswered ? null : book.get(chatId) ?? null, unanswered: memoUnanswered, malformed: false };
       },
       set: async (chatId: string, memo: DetailMemo) => {
@@ -120,6 +122,7 @@ function fakeStore({ stored = null as ModeRecord | null, unanswered = false, mem
       clear: async (chatId: string) => {
         counts.memoClears += 1;
         book.delete(chatId);
+        malformed.splice(0, malformed.length, ...malformed.filter((id) => id !== chatId));
         return { ok: true, unanswered: false };
       },
     },
@@ -733,7 +736,7 @@ test('the retry comes a day after a first failure that may pass, and a week afte
   const cases: [string, Answer, number][] = [
     ['a timeout', { kind: 'timeout' }, DAY],
     ['a network failure', { kind: 'network' }, DAY],
-    ['HTTP 503', { kind: 'ok', status: 503, text: '' }, DAY],
+    ['HTTP 500', { kind: 'ok', status: 500, text: '' }, DAY],
     ['HTTP 404', { kind: 'ok', status: 404, text: '' }, 7 * DAY],
     ['an error frame', ERROR_READ, 7 * DAY],
     ['HTML', { kind: 'ok', status: 200, text: '<html></html>' }, 7 * DAY],
@@ -838,4 +841,65 @@ test('in detail mode every store call is preceded by a keep-alive call, memo cal
   const { counts } = store;
   assert.equal(run.keepAlives, side.counts.windows + side.counts.reads + side.counts.stampTries + counts.gets + counts.sets + counts.memoGets + counts.memoSets + counts.memoClears);
   assert.deepEqual([counts.memoGets, counts.memoSets, counts.memoClears], [2, 1, 1], 'Test setup invalid: the pass made other memo calls than expected');
+});
+
+test('a summary that could not be dispatched writes no memo, so the next pass reads the chat and sends it', async () => {
+  const side = framework({ summarize: false });
+  const store = fakeStore();
+  const listed = () => client({ main: listPage(entries(1)), reads: { [chatId(1)]: ERROR_READ } });
+  const first = await pass(listed(), side, {}, { store, throwOn: chatId(1) });
+  assert.deepEqual([first.sent, store.memos.size], [[], 0]);
+  const second = await pass(listed(), side, {}, { store });
+  assert.deepEqual([second.sent.map((record) => [record.identifier, record.is_summary]), memoOf(store, 1)?.failures], [[[chatId(1), true]], 1]);
+});
+
+test('a failed read of a newer last message sends its summary and starts the memo again', async () => {
+  const store = fakeStore({ memos: { [chatId(1)]: { ended: (T - 60) * 1000, at: NOW - 1000, retryMs: 7 * DAY, failures: 3 } } });
+  const run = await pass(client({ main: listPage(entries(1)), reads: { [chatId(1)]: ERROR_READ } }), framework({ summarize: false }), {}, { store });
+  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary]), [[chatId(1), true]]);
+  assert.deepEqual(memoOf(store, 1), { ended: T * 1000, at: NOW + 60_000, retryMs: 7 * DAY, failures: 1 });
+});
+
+test('a rate limit or an overloaded server ends the reads, with no memo and no summary', async () => {
+  for (const status of [429, 503]) {
+    const fake = client({ main: listPage(entries(2)), reads: { [chatId(2)]: { kind: 'ok', status, text: '' } } });
+    const store = fakeStore();
+    const run = await pass(fake, framework({ summarize: false }), {}, { store });
+    assert.deepEqual([readsOf(fake), run.sent, store.memos.size, run.outcome.reason], [[chatId(2)], [], 0, 'Fetch successful.'], String(status));
+  }
+});
+
+test('chats held back by a memo neither count toward the run of failed reads nor end it', async () => {
+  const held: DetailMemo = { ended: (T + 3) * 1000, at: NOW - 1000, retryMs: DAY, failures: 1 };
+  const fake = client({ main: listPage(entries(5)), reads: { [chatId(5)]: ERROR_READ, [chatId(3)]: ERROR_READ, [chatId(2)]: ERROR_READ } });
+  const run = await pass(fake, framework({ summarize: false }), {}, { store: fakeStore({ memos: { [chatId(4)]: held } }) });
+  assert.deepEqual([readsOf(fake), run.outcome.reason], [[chatId(5), chatId(3), chatId(2)], STOPPED]);
+});
+
+test('a chat that fails again does not count toward the run of failed reads', async () => {
+  const again = (n: number): DetailMemo => ({ ended: (T + n - 1) * 1000, at: NOW - 8 * DAY, retryMs: 7 * DAY, failures: 1 });
+  const fake = client({ main: listPage(entries(5)), reads: { [chatId(5)]: ERROR_READ, [chatId(4)]: ERROR_READ, [chatId(3)]: ERROR_READ } });
+  const store = fakeStore({ memos: { [chatId(5)]: again(5), [chatId(4)]: again(4), [chatId(3)]: again(3) } });
+  const run = await pass(fake, framework({ summarize: false }), {}, { store });
+  assert.deepEqual([readsOf(fake).length, run.outcome.reason], [5, 'Fetch successful.']);
+});
+
+test('failed reads after a list read only in part keep the partial reason, and name the failure as the issue', async () => {
+  const fake = client({ other: ERROR_FRAME, main: listPage(entries(1)), reads: { [chatId(1)]: ERROR_READ } });
+  const run = await pass(fake, framework({ summarize: false, haltOnError: true }));
+  assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1)], reason: 'Full fetch unsuccessful. Partial results returned.', issue: STOPPED });
+});
+
+test('a memo from a clock that ran fast does not hold its chat back', async () => {
+  const fake = client({ main: listPage(entries(1)) });
+  const store = fakeStore({ memos: { [chatId(1)]: { ended: T * 1000, at: NOW + 3 * DAY, retryMs: DAY, failures: 1 } } });
+  await pass(fake, framework({ summarize: false }), {}, { store });
+  assert.deepEqual(readsOf(fake), [chatId(1)]);
+});
+
+test('a memo that holds something else is read as none, and a successful read clears it', async () => {
+  const fake = client({ main: listPage(entries(1)) });
+  const store = fakeStore({ malformed: [chatId(1)] });
+  await pass(fake, framework({ summarize: false }), {}, { store });
+  assert.deepEqual([readsOf(fake), store.counts.memoClears], [[chatId(1)], 1]);
 });
