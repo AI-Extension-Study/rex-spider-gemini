@@ -1,10 +1,11 @@
-import check from 'check-types'
+import { type Conversation, type DateString } from '@bric/rex-types/types'
 
-import { Conversation, DateString } from '@bric/rex-types/types'
+import { type EventPayload, dispatchEvent } from '@bric/rex-core/service-worker'
 
-import { EventPayload, dispatchEvent } from '@bric/rex-core/service-worker'
+import rexSpiderPlugin, { REXSpider, type REXSpiderCrawlResult, type REXSpiderCrawlInspection } from '@bric/rex-spider/service-worker'
 
-import rexSpiderPlugin, { REXSpider, REXSpiderCrawlResult, REXSpiderCrawlInspection } from '@bric/rex-spider/service-worker'
+import { LIST_RPC, parseListPage, toConversation } from './list.mts'
+import { bardErrorCodes, batchBody, batchUrl } from './wire.mts'
 
 const GEMINI_SPIDER_PAGE_SIZE = 10
 
@@ -65,126 +66,38 @@ export class REXGeminiSpider extends REXSpider {
     })
   }
 
-  parseChatList(rawChatListData:string) : Conversation[] | null {
-    try {
-      if (rawChatListData.startsWith(')]}\'')) {
-        rawChatListData = rawChatListData.substring(4).trim()
-
-        const lines = rawChatListData.split(/\r?\n/)
-
-        const parsed:Conversation[] = []
-        let foundValidResponse:boolean = false
- 
-        for (const line of lines) {
-          if (line.startsWith('[[')) {
-            const parsedLine = JSON.parse(line)
-
-            for (const message of parsedLine) {
-              if (message.length > 2 && message[1] === 'MaZiqc') {
-                foundValidResponse = true
-
-                const chatList = JSON.parse(message[2])
-
-                if (chatList !== null && check.array(chatList[2])) {
-                  for (const chat of chatList[2]) {
-                    const conversation:Conversation = {
-                      identifier: chat[0],
-                      turns: [],
-                      platform: 'gemini',
-                      ended: new DateString(chat[5][0]),
-                      metadata: chat
-                    }
-
-                    parsed.push(conversation)
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        if (foundValidResponse) {
-          return parsed
-        }
-      }
-    } catch (err) {
-      console.error(`[rex-spider-gemini] Error parsing conversation:`)
-      console.error(err)
-    }
-
-    return null
-  }
-
-  fetchNextPageToken(rawChatListData:string) : string | null {
-    // Raw payload:
-    // [["wrb.fr","MaZiqc","[null,\"TOKEN\",[[CONVERSATIONS]]]", ...]]
-
-    // console.log(`rawChatListData: ${rawChatListData}`)
-
-    try {
-      if (rawChatListData.startsWith(')]}\'')) {
-        rawChatListData = rawChatListData.substring(4).trim()
-
-        const lines = rawChatListData.split(/\r?\n/)
-
-        for (const line of lines) {
-          if (line.startsWith('[[')) {
-            const parsedLine = JSON.parse(line)
-
-            for (const message of parsedLine) {
-              if (message.length > 2 && message[1] === 'MaZiqc') {
-                const chatList = JSON.parse(message[2])
-
-                // Return string serving as next page token.
-
-                if (chatList !== null && chatList.length > 2) {
-                  return chatList[1]
-                }
-
-                return null
-              }
-            }
-          }
-        }
-      }
-    } catch (err) {
-      console.error(`[rex-spider-gemini] Error parsing conversation:`)
-      console.error(err)
-    }
-
-    return null
-  }
-
   fetchChats(): Promise<[REXSpiderCrawlInspection[], boolean]> {
     return new Promise<[REXSpiderCrawlInspection[], boolean]>((resolve, reject) => {
       const requestId = Math.floor(Math.random() * (999999 - 10000)) + 10000
 
-      const chatsUrl = `https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&hl=en&rt=c&_reqid=${requestId}`
+      const chatsUrl = batchUrl(LIST_RPC, requestId)
 
-      const payloads = [{
-        'f.req': `[[["MaZiqc","[${GEMINI_SPIDER_PAGE_SIZE},null,[0,null,1]]",null,"generic"]]]`,
-        'at': (this.accessToken as string)
-      }, {
-        'f.req': `[[["MaZiqc","[${GEMINI_SPIDER_PAGE_SIZE},null,[1,null,1]]",null,"generic"]]]`,
-        'at': (this.accessToken as string)
-      }]
+      // The arguments of the list calls still to make, the last one first.
+      const pending:unknown[][] = [
+        [GEMINI_SPIDER_PAGE_SIZE, null, [0, null, 1]],
+        [GEMINI_SPIDER_PAGE_SIZE, null, [1, null, 1]]
+      ]
 
       const checkedRecords:REXSpiderCrawlInspection[] = []
 
-      const fetchNext = () => {
-        if (payloads.length == 0) {
-          resolve([checkedRecords, true])
-        } else {
-          const nextPayload = payloads.pop()
+      // Cleared by an answer the walk could not read in full, so the pass
+      // reports itself as partial even when every call was made.
+      let complete = true
 
-          if (nextPayload !== undefined) {
+      const fetchNext = () => {
+        if (pending.length == 0) {
+          resolve([checkedRecords, complete])
+        } else {
+          const args = pending.pop()
+
+          if (args !== undefined) {
             fetch(chatsUrl, {
               method: 'POST',
               credentials: 'include',
               headers: {
                 'Content-Type': 'application/x-www-form-urlencoded'
-              },        
-              body: new URLSearchParams(nextPayload)
+              },
+              body: batchBody(LIST_RPC, args, this.accessToken as string)
             }).then((response: Response) => {
               if (!response.ok) {
                 if (checkedRecords.length === 0) {
@@ -195,85 +108,91 @@ export class REXGeminiSpider extends REXSpider {
                 }
               } else {
                 response.text().then((rawBody) => {
-                  if (rawBody.includes('[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1096]]')) {
+                  if (bardErrorCodes(rawBody).includes(1096)) {
                     console.log(`[rex-spider-gemini] Error parsing conversation list. Authorization has likely expired. (This will be fixed soon.)`)
                     resolve([checkedRecords, false])
 
                     return
                   }
 
-                  const nextToken:string|null = this.fetchNextPageToken(rawBody)
+                  const page = parseListPage(rawBody)
 
-                  if (nextToken !== null) {
-                    const newRequestWrapper = JSON.parse(nextPayload['f.req'])
+                  if (page.kind === 'not-a-list') {
+                    reject(`Received invalid response for conversation API. Request: ${JSON.stringify(args)}`)
 
-                    const newRequest = JSON.parse(newRequestWrapper[0][0][1])
-
-                    newRequest[1] = nextToken
-
-                    newRequestWrapper[0][0][1] = JSON.stringify(newRequest)
-
-                    const newPayload = {
-                      'at': nextPayload['at'],
-                      'f.req': JSON.stringify(newRequestWrapper)
-                    }
-
-                    payloads.push(newPayload)
+                    return
                   }
 
-                  const parsed:Conversation[] | null = this.parseChatList(rawBody)
+                  // A failed list call is not an account without chats. The walk
+                  // goes on to the calls left, and the pass reports itself as
+                  // partial.
+                  if (page.kind === 'error') {
+                    console.log(`[rex-spider-gemini] A conversation list call answered with an error (code ${page.code}).`)
 
-                  if (parsed !== null) {
-                    const checkNextConversation = () => {
-                      if (parsed.length === 0) {
-                        setTimeout(fetchNext, this.fetchCrawlDelay())
-                      } else {
-                        const nextConvo:Conversation | undefined = parsed.pop()
+                    complete = false
 
-                        if (nextConvo !== undefined && nextConvo.ended !== undefined) {
-                          try {
-                            this.crawlWindowContains(nextConvo.ended.timestamp()).then((include) => {
-                              if (include && nextConvo.ended !== undefined) {
-                                this.checkIfAlreadyTransmitted(nextConvo.identifier, nextConvo.ended).then((transmitted:boolean) => {
-                                  if (nextConvo.ended !== undefined) {
-                                    if (transmitted) {
-                                      checkedRecords.push({
-                                        id: nextConvo.identifier,
-                                        refresh: false,
-                                        conversation: nextConvo,
-                                        lookupDate: nextConvo.ended
-                                      })
-                                    } else {
-                                      checkedRecords.push({
-                                        id: nextConvo.identifier,
-                                        refresh: true,
-                                        conversation: nextConvo,
-                                        lookupDate: nextConvo.ended
-                                      })
-                                    }
+                    setTimeout(fetchNext, this.fetchCrawlDelay())
+
+                    return
+                  }
+
+                  if (page.skipped > 0) {
+                    console.log(`[rex-spider-gemini] Skipped ${page.skipped} conversation list entries without an id or a time.`)
+
+                    complete = false
+                  }
+
+                  if (page.next !== null) {
+                    pending.push([args[0], page.next, args[2]])
+                  }
+
+                  const parsed:Conversation[] = page.items.map(toConversation)
+
+                  const checkNextConversation = () => {
+                    if (parsed.length === 0) {
+                      setTimeout(fetchNext, this.fetchCrawlDelay())
+                    } else {
+                      const nextConvo:Conversation | undefined = parsed.pop()
+
+                      if (nextConvo !== undefined && nextConvo.ended !== undefined) {
+                        try {
+                          this.crawlWindowContains(nextConvo.ended.timestamp()).then((include) => {
+                            if (include && nextConvo.ended !== undefined) {
+                              this.checkIfAlreadyTransmitted(nextConvo.identifier, nextConvo.ended).then((transmitted:boolean) => {
+                                if (nextConvo.ended !== undefined) {
+                                  if (transmitted) {
+                                    checkedRecords.push({
+                                      id: nextConvo.identifier,
+                                      refresh: false,
+                                      conversation: nextConvo,
+                                      lookupDate: nextConvo.ended
+                                    })
+                                  } else {
+                                    checkedRecords.push({
+                                      id: nextConvo.identifier,
+                                      refresh: true,
+                                      conversation: nextConvo,
+                                      lookupDate: nextConvo.ended
+                                    })
                                   }
+                                }
 
-                                  checkNextConversation()
-                                })
-                              } else {
                                 checkNextConversation()
-                              }
-                            })
-                          } catch (err) {
-                            reject(`Error encountered processing conversation: ${err}`)
-                          }
-                        } else {
-                          checkNextConversation()
+                              })
+                            } else {
+                              checkNextConversation()
+                            }
+                          })
+                        } catch (err) {
+                          reject(`Error encountered processing conversation: ${err}`)
                         }
+                      } else {
+                        checkNextConversation()
                       }
                     }
-
-                    checkNextConversation()
-                  } else {
-                    nextPayload.at = '<redacted>'
-                    
-                    reject(`Received invalid response for conversation API. Request: ${JSON.stringify(nextPayload)}`)
                   }
+
+                  checkNextConversation()
                 })
                 .catch((err) => {
                   reject(`Unable to retrieve body from ${chatsUrl}: ${err}.`)
