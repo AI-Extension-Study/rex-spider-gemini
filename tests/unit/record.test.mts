@@ -64,7 +64,7 @@ test('no prompt or reply text, file name, URL, token or account constant from th
 test('a read that was cut gives no started, and the record is dated by its last message', () => {
   const cut = read(readResponse([exchange({ chat: CHAT, response: 3, parent: 2, seconds: 1700000300 })], 'MORE'));
   const record = JSON.parse(JSON.stringify(buildDetailRecord(item, cut)));
-  assert.equal('started' in record, false);
+  assert.equal('started' in record, false, 'a cut read gave a start time it cannot know');
   assert.equal(record.date, 1700000300000);
   assert.equal(record.turns.length, 1);
 });
@@ -74,4 +74,10 @@ test('both records give rex-spider the same last-message time, so their upload k
   const detail = buildDetailRecord(item, read(threeExchanges));
   assert.equal(Math.round(summary.ended.timestamp()), 1700000300000);
   assert.equal(Math.round(detail.ended.timestamp()), 1700000300000);
+});
+
+test('a whole read with no exchanges gives no started and is dated by its last message', () => {
+  const record = JSON.parse(JSON.stringify(buildDetailRecord(item, read(readResponse([])))));
+  assert.equal('started' in record, false, 'a read with no exchanges gave a start time');
+  assert.deepEqual([record.date, record.turns], [1700000300000, []]);
 });

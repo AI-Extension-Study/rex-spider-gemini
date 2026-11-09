@@ -32,7 +32,28 @@ test('a read gives each exchange\'s response id, parent, time, drafts and attach
 
 test('a read with a cursor in payload[1] was cut and is not whole', () => {
   const result = parseRead(readResponse([exchange({ chat: CHAT, response: 1, seconds: 1700000100 })], 'MORE'));
-  assert.equal(result.kind === 'read' ? result.whole : result.kind, false);
+  assert.equal(result.kind === 'read' ? result.whole : result.kind, false, 'a read that carries a cursor counted as whole');
+});
+
+test('an empty-string cursor counts as none: the read is whole', () => {
+  const result = parseRead(readResponse([exchange({ chat: CHAT, response: 1, seconds: 1700000100 })], ''));
+  assert.equal(result.kind === 'read' ? result.whole : result.kind, true, 'an empty cursor counted as more to read');
+});
+
+test('files are counted from the first file list of the prompt; its twin list is not read', () => {
+  const ex = exchange({ chat: CHAT, response: 1, seconds: 1700000100, mimes: ['image/png'] });
+  const holder = ((ex[2] as unknown[])[0] as unknown[])[4] as unknown[][];
+  const twin = exchange({ chat: CHAT, response: 9, seconds: 1, mimes: ['application/pdf', 'application/pdf'] });
+  holder[0][4] = ((((twin[2] as unknown[])[0] as unknown[])[4] as unknown[][])[0])[3];
+  const result = parseRead(readResponse([ex]));
+  assert.deepEqual(result.kind === 'read' ? result.exchanges[0].attachmentTypes : result, ['image/png']);
+});
+
+test('a reply without a drafts list counts no drafts', () => {
+  const ex = exchange({ chat: CHAT, response: 1, seconds: 1700000100 });
+  (ex[3] as unknown[])[0] = null;
+  const result = parseRead(readResponse([ex]));
+  assert.equal(result.kind === 'read' ? result.exchanges[0].drafts : result.kind, 0);
 });
 
 test('an exchange without a response id of r_ form or a numeric time is skipped and counted', () => {
