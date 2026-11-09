@@ -307,41 +307,30 @@ test('a round that starts while the spider is still crawling skips it', async ({
   expect(completions(events)).toEqual([[-1, [], '[gemini] Still crawling.'], [1, [chat(1)], 'Fetch successful.']])
 })
 
-// The served configs say halt_on_error false.
-test('a chat whose read fails goes out as a summary, and its memo holds it back from the next crawl', async ({ context, serviceWorker }) => {
+// The served configs say halt_on_error false; rex-spider's default is true,
+// and its own flag, once false, never turns true again.
+test('a failed read goes out as a summary and its memo holds the chat back, and a refresh without halt_on_error stops the reads at the next failure', async ({ context, serviceWorker }) => {
   test.setTimeout(60_000)
-  const traffic = await answerGemini(context, [entry(1, T), entry(2, T + 60)], { failReads: [2] })
+  const listed = [entry(1, T), entry(2, T + 60)]
+  const traffic = await answerGemini(context, listed, { failReads: [2, 3] })
   await untilStoreOpen(serviceWorker)
   await configure(serviceWorker, { halt_on_error: false })
 
   const first = await crawl(serviceWorker)
   expect(traffic.calls.splice(0)).toEqual([...ONE_CRAWL, READ_CALL(2), READ_CALL(1)])
-  expect(records(first.events)).toEqual([summary(2, T + 60, '2023-11-14T22:14:20Z'), detail(1, T)])
+  expect(records(first.events)).toEqual([summary(2, T + 60, iso(T + 60)), detail(1, T)])
   expect(completions(first.events)).toEqual([[2, [chat(1), chat(2)], 'Fetch successful.']])
 
   const second = await crawl(serviceWorker)
   expect(traffic.calls.splice(0)).toEqual(ONE_CRAWL)
   expect(records(second.events)).toEqual([])
-})
 
-test('served no halt_on_error, the reads stop at the first failure, and serving it false takes', async ({ context, serviceWorker }) => {
-  test.setTimeout(60_000)
-  const listed = [entry(1, T), entry(2, T + 60)]
-  const traffic = await answerGemini(context, listed, { failReads: [2, 3] })
-  await untilStoreOpen(serviceWorker)
+  // A new chat whose read fails, and an older one after it.
+  listed.push(entry(3, T + 120), entry(4, T + 30))
   await configure(serviceWorker)
-
-  const first = await crawl(serviceWorker)
-  expect(traffic.calls.splice(0)).toEqual([...ONE_CRAWL, READ_CALL(2)])
-  expect(records(first.events)).toEqual([summary(2, T + 60, '2023-11-14T22:14:20Z')])
-  expect(completions(first.events)).toEqual([[1, [chat(1), chat(2)], 'Crawl stopped: detail reads failed.']])
-  expect(first.result.issues).toEqual([{ url: HOME, message: 'Crawl stopped: detail reads failed.' }])
-
-  // A new chat whose read fails too: the reads now go on past it, and c_2 is held back.
-  listed.push(entry(3, T + 120))
-  await configure(serviceWorker, { halt_on_error: false })
-  const second = await crawl(serviceWorker)
-  expect(traffic.calls.splice(0)).toEqual([...ONE_CRAWL, READ_CALL(3), READ_CALL(1)])
-  expect(records(second.events)).toEqual([summary(3, T + 120, '2023-11-14T22:15:20Z'), detail(1, T)])
-  expect(completions(second.events)).toEqual([[2, [chat(1), chat(2), chat(3)], 'Fetch successful.']])
+  const third = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual([...ONE_CRAWL, READ_CALL(3)])
+  expect(records(third.events)).toEqual([summary(3, T + 120, iso(T + 120))])
+  expect(completions(third.events)).toEqual([[1, [chat(1), chat(2), chat(3), chat(4)], 'Crawl stopped: detail reads failed.']])
+  expect(third.result.issues).toEqual([{ url: HOME, message: 'Crawl stopped: detail reads failed.' }])
 })
