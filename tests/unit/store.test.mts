@@ -110,3 +110,61 @@ test('log lines name a key\'s kind, never the chat id in it', { timeout: 2000 },
   assert.ok(lines.every((line) => !line.includes('c_0000000000000001')), lines.join('\n'));
   assert.ok(lines.every((line) => line.includes('rex-spider-gemini-detail-memo')), lines.join('\n'));
 });
+
+test('a stored 0, false or empty string reads back as itself, not as absent', async () => {
+  const store = createStore(rexCore().handleMessage, { log: quiet });
+  for (const value of [0, false, '']) {
+    await store.set('k', value);
+    assert.deepEqual(await store.get('k'), { value, unanswered: false }, JSON.stringify(value));
+  }
+});
+
+test('a call answered in time logs nothing when its deadline passes later', { timeout: 2000 }, async () => {
+  const lines: string[] = [];
+  const store = createStore(rexCore().handleMessage, { deadlineMs: 20, log: (line) => lines.push(line) });
+  await store.get('k');
+  await store.set('k', 1);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(lines, []);
+});
+
+test('an answer given before handleMessage throws still counts', async () => {
+  const answersThenThrows = ((_message: Message, _sender: unknown, sendResponse: (response: unknown) => void) => {
+    sendResponse('stored');
+    throw new Error('after the answer');
+  }) as unknown as HandleMessage;
+  const lines: string[] = [];
+  const store = createStore(answersThenThrows, { log: (line) => lines.push(line) });
+  assert.deepEqual(await store.get('k'), { value: 'stored', unanswered: false });
+  assert.deepEqual(lines, [], 'an answered call was logged as unanswered');
+});
+
+test('a write rex-core refuses answers not ok, and answered', async () => {
+  const refuses = ((message: Message, _sender: unknown, sendResponse: (response: unknown) => void) => {
+    queueMicrotask(() => sendResponse(message.messageType === 'storeValue' ? false : null));
+    return true;
+  }) as unknown as HandleMessage;
+  const store = createStore(refuses, { log: quiet });
+  assert.deepEqual(await store.set('k', 1), { ok: false, unanswered: false });
+});
+
+test('a write that handleMessage reports as unhandled still waits for its answer', { timeout: 2000 }, async () => {
+  const answersLater = ((_message: Message, _sender: unknown, sendResponse: (response: unknown) => void) => {
+    setTimeout(() => sendResponse(true), 5);
+    return false;
+  }) as unknown as HandleMessage;
+  const store = createStore(answersLater, { deadlineMs: 200, log: quiet });
+  assert.deepEqual(await store.set('k', 1), { ok: true, unanswered: false });
+});
+
+test('memo fields of the wrong form, and arrays dressed as records, read as malformed', async () => {
+  const core = rexCore();
+  const store = createStore(core.handleMessage, { log: quiet });
+  const good = { ended: 1700000000000, at: 1700000100000, retryMs: 86_400_000, failures: 1 };
+  for (const bad of [{ ...good, failures: 0 }, { ...good, ended: -1 }, { ...good, at: 1.5 }, Object.assign([], good)]) {
+    core.values.set(memoKey('c_0000000000000001'), bad);
+    assert.deepEqual(await store.memo.get('c_0000000000000001'), { value: null, unanswered: false, malformed: true }, JSON.stringify(bad));
+  }
+  core.values.set('rex-spider-gemini-mode', Object.assign([], { mode: 'summary', since: 1 }));
+  assert.deepEqual(await store.mode.get(), { value: null, unanswered: false, malformed: true });
+});

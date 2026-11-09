@@ -30,3 +30,8 @@ test('what may be logged of a key is its kind, never a chat id', () => {
   assert.equal(keyKind(memoKey('c_0000000000000001')), 'rex-spider-gemini-detail-memo');
   assert.equal(keyKind('rex-spider-gemini-conversation-upload-c_0000000000000001-1700000000000'), 'other key');
 });
+
+test('a chat id that is not a string is refused at run time too', () => {
+  assert.throws(() => memoKey(123 as unknown as string), TypeError);
+  assert.throws(() => uploadKeyId(null as unknown as string, false), TypeError);
+});
