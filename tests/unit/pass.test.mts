@@ -5,6 +5,7 @@ import { type DateString } from '@bric/rex-types/types';
 
 import { type Answer } from '../../src/client.mts';
 import { type PassFramework, runPass } from '../../src/pass.mts';
+import { parseRead } from '../../src/read.mts';
 import { type GeminiRecord } from '../../src/record.mts';
 import { type ModeRecord } from '../../src/store.mts';
 import { batchResponse, chatId, listEntry, wrb, wrbError } from './batch.mts';
@@ -55,9 +56,11 @@ function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Rec
 // ended in ms). A stamp adds its key, so a later pass on the same side sees
 // it. Summary mode unless a test serves detail.
 // unkeptStamps: a stamp that is answered but not written, as rex-spider's
-// logTransmitted resolves after a failed write.
-function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
+// logTransmitted resolves after a failed write. silentReadBacks: a read of a
+// key stamped in this pass gets no answer.
+function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
+  const stampedNow = new Set<string>();
   const stamped: string[] = [];
   const events: string[] = [];
   const counts = { windows: 0, reads: 0, stampTries: 0 };
@@ -70,7 +73,8 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
     },
     checkIfAlreadyTransmitted: (id: string, ended: DateString) => {
       counts.reads += 1;
-      return silentReads ? new Promise(() => {}) : Promise.resolve(keys.has(`${id} ${Math.round(ended.timestamp())}`));
+      const key = `${id} ${Math.round(ended.timestamp())}`;
+      return silentReads || (silentReadBacks && stampedNow.has(key)) ? new Promise(() => {}) : Promise.resolve(keys.has(key));
     },
     logTransmitted: (id: string, ended: DateString) => {
       counts.stampTries += 1;
@@ -79,6 +83,7 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
       if (unkeptStamps) return Promise.resolve();
       const key = `${id} ${Math.round(ended.timestamp())}`;
       keys.add(key);
+      stampedNow.add(key);
       stamped.push(key);
       return Promise.resolve();
     },
@@ -553,11 +558,13 @@ test('a switch-off during the reads stops them before the next read, and the rec
 });
 
 test('a failed read sends and stamps nothing for its chat, and the reads go on', async () => {
+  // The HTTP 500 case carries a body that reads as a read, so only its status can fail it.
+  const readable = readResponse([exchange({ chat: chatId(2), response: 1, seconds: T - 60 })]);
+  assert.equal(parseRead(readable, chatId(2)).kind, 'read', 'Test setup invalid: the HTTP 500 body does not read as a read');
   const cases: [string, Answer][] = [
     ['a timeout', { kind: 'timeout' }],
     ['a network failure', { kind: 'network' }],
-    // With a body that reads as a read, so only the status can fail it.
-    ['HTTP 500', { kind: 'ok', status: 500, text: readResponse([exchange({ chat: chatId(2), response: 1, seconds: T - 60 })]) }],
+    ['HTTP 500', { kind: 'ok', status: 500, text: readable }],
     ['an error frame', { kind: 'ok', status: 200, text: batchResponse(wrbError('hNvQHb', 5)) }],
     ['HTML', { kind: 'ok', status: 200, text: '<html></html>' }],
   ];
@@ -586,6 +593,12 @@ test('a stamp the store does not keep stops the sending, in either mode', async 
   const detail = framework({ summarize: false, unkeptStamps: true });
   const inDetail = await pass(fake, detail);
   assert.deepEqual([readsOf(fake), detail.counts.stampTries, inDetail.outcome.crawledCount], [[chatId(3)], 1, 1], 'detail');
+});
+
+test('a read-back that gets no answer stops the sending', { timeout: 2000 }, async () => {
+  const side = framework({ silentReadBacks: true });
+  const run = await pass(client({ main: listPage(entries(3)) }), side, { batch: 2 });
+  assert.deepEqual([run.sent.length, side.counts.stampTries, run.outcome.crawledCount, run.outcome.reason], [2, 1, 2, 'Fetch successful.']);
 });
 
 test('a stamp that gets no answer stops the reads', { timeout: 2000 }, async () => {

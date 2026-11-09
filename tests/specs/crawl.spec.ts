@@ -220,7 +220,7 @@ test('after an update, served no summarize, only the chats last used in the 90 d
 
 // A config may turn summary on later, and off again.
 test('a switch of mode re-sends only the chats last used in the 90 days before it, and the switch back takes', async ({ context, serviceWorker }) => {
-  // Four reads and a summary batch, each with a 3 s wait.
+  // Three reads and a summary batch, with six waits of 3 s.
   test.setTimeout(60_000)
   const now = Math.floor(Date.now() / 1000)
   const [old, recent] = [now - 100 * 86400, now - 3600]

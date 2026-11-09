@@ -155,9 +155,10 @@ function dispatched(ctx: Sending, record: GeminiRecord): boolean {
 // Stamps a sent record's key, in the record's own mode, and reads it back:
 // rex-spider's logTransmitted resolves whatever the store answers, a failed
 // write included. A stamp that fails, is not kept, or gets no answer stops
-// the stamping and the sending: records sent from here on could not be
-// stamped either, so none are, and they go out next pass instead of twice.
-// The records already sent stay counted.
+// the stamping and the sending for the pass: the store is failing, and a
+// silent one would hold each further stamp for its whole deadline. A record
+// sent but not stamped, the rest of a summary batch included, goes out again
+// in a later pass, so none is lost. The records already sent stay counted.
 async function stamped(ctx: Sending, record: GeminiRecord): Promise<boolean> {
   const { framework, keepAlive } = ctx.deps;
   const id = uploadKeyId(record.identifier, record.is_summary);
