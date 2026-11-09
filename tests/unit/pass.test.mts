@@ -37,10 +37,13 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stamped: string[] = [];
   const events: string[] = [];
-  const counts = { reads: 0, stampTries: 0 };
+  const counts = { windows: 0, reads: 0, stampTries: 0 };
   const fw: PassFramework = {
     isEnabled: enabled,
-    crawlWindowContains: async (ms) => ms >= windowStart,
+    crawlWindowContains: async (ms) => {
+      counts.windows += 1;
+      return ms >= windowStart;
+    },
     checkIfAlreadyTransmitted: (id: string, ended: DateString) => {
       counts.reads += 1;
       return silentReads ? new Promise(() => {}) : Promise.resolve(keys.has(`${id} ${Math.round(ended.timestamp())}`));
@@ -184,10 +187,11 @@ test('a stamp that gets no answer stops stamping and sending for the pass, which
     [2, 'Fetch successful.', 1, [chatId(3), chatId(2)]]);
 });
 
-test('a long check of the listed chats makes a keep-alive call every 100 chats', async () => {
-  const run = await pass(client({ main: listPage(entries(250)) }), framework({ held: entries(250).map((entry, i) => [String(entry[0]), (T + i) * 1000]) }));
-  assert.equal(run.keepAlives, 2);
-  assert.equal(run.sent.length, 0);
+test('every store call is preceded by a keep-alive call', async () => {
+  const side = framework({ held: [[chatId(1), T * 1000]] });
+  const run = await pass(client({ main: listPage(entries(3)) }), side);
+  assert.equal(run.keepAlives, side.counts.windows + side.counts.reads + side.counts.stampTries);
+  assert.deepEqual([side.counts.windows, side.counts.reads, side.counts.stampTries], [3, 3, 2], 'Test setup invalid: the pass made other store calls than expected');
 });
 
 test('a dispatch that throws is logged, its key is not stamped, and the pass goes on', async () => {
@@ -224,16 +228,77 @@ test('a pass never throws: a framework call that throws ends it with an error re
 test('enabled turning false stops the walk before its next list call, and nothing is sent', async () => {
   let calls = 0;
   const fake = client({ other: listPage(entries(1)), main: listPage(entries(2)) });
-  const side = framework({ enabled: () => (calls += 1) <= 1 });
+  // Read once before the homepage, once before the first list call.
+  const side = framework({ enabled: () => (calls += 1) <= 2 });
   const run = await pass(fake, side);
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length], [0, 'Crawl stopped: spider disabled.', 0]);
   assert.equal(fake.calls.filter((call) => call.startsWith('list')).length, 1, 'a list call went out after the spider was switched off');
+  assert.equal(side.counts.reads, 0, 'chats were checked after the spider was switched off');
 });
 
 test('enabled turning false stops sending before the next batch', async () => {
   let checks = 0;
-  // Two list calls read enabled once each; the first batch reads it third.
-  const side = framework({ enabled: () => (checks += 1) <= 3 });
+  // The homepage and the two list calls read enabled once each; the first
+  // batch reads it fourth.
+  const side = framework({ enabled: () => (checks += 1) <= 4 });
   const run = await pass(client({ main: listPage(entries(3)) }), side, { batch: 2 });
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.map((record) => record.identifier)], [2, 'Crawl stopped: spider disabled.', [chatId(3), chatId(2)]]);
+});
+
+test('a spider switched off before its pass begins makes no request at all', async () => {
+  const fake = client({ main: listPage(entries(1)) });
+  const run = await pass(fake, framework({ enabled: () => false }));
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, fake.calls], [0, 'Crawl stopped: spider disabled.', []]);
+});
+
+test('a switch-off during the wait between list calls stops the next call', async () => {
+  let switchedOff = false;
+  const fake = client({ other: listPage(entries(1)), main: listPage(entries(2)) });
+  const side = framework({ enabled: () => !switchedOff });
+  const outcome = await runPass({
+    client: fake,
+    framework: side.fw,
+    dispatch: () => {},
+    sleep: async () => {
+      switchedOff = true;
+    },
+    keepAlive: () => {},
+    requestId: 1,
+    limits: { settleMs: 1500, batch: 25, storeMs: 20 },
+    log: () => {},
+  });
+  assert.equal(outcome.reason, 'Crawl stopped: spider disabled.');
+  assert.equal(fake.calls.filter((call) => call.startsWith('list')).length, 1, 'the call after the wait went out with the config read before it');
+});
+
+test('a stamp that throws or rejects stops stamping and sending, and the records sent stay counted', async () => {
+  for (const failure of ['throws', 'rejects']) {
+    const side = framework();
+    side.fw.logTransmitted = () => {
+      if (failure === 'throws') throw new TypeError('stamp broke');
+      return Promise.reject(new TypeError('stamp broke'));
+    };
+    const run = await pass(client({ main: listPage(entries(3)) }), side, { batch: 2 });
+    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [2, 'Fetch successful.'], failure);
+  }
+});
+
+test('an internal error is logged by the error\'s kind, never its message', async () => {
+  const side = framework();
+  side.fw.crawlWindowContains = async () => {
+    throw new TypeError('secret detail');
+  };
+  const lines: string[] = [];
+  await runPass({
+    client: client({ main: listPage(entries(1)) }),
+    framework: side.fw,
+    dispatch: () => {},
+    sleep: async () => {},
+    keepAlive: () => {},
+    requestId: 1,
+    limits: { settleMs: 1500, batch: 25, storeMs: 20 },
+    log: (line) => lines.push(line),
+  });
+  assert.ok(lines.some((line) => line.includes('internal error (TypeError)')), lines.join('\n'));
+  assert.ok(lines.every((line) => !line.includes('secret detail')), lines.join('\n'));
 });

@@ -46,10 +46,6 @@ export interface PassLimits {
 
 export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000 };
 
-// A keep-alive call every this many chats in a loop that makes no request:
-// store reads do not reset the worker's idle timer.
-const KEEP_ALIVE_EVERY = 100;
-
 export interface PassDeps {
   readonly client: Pick<Client, 'get' | 'postForm'>;
   readonly framework: PassFramework;
@@ -76,8 +72,11 @@ const failed = (reason: string, issue: string = reason): PassOutcome => ({ crawl
 
 class StoreSilent extends Error {}
 
-async function step<T>(promise: Promise<T>, ms: number): Promise<T> {
-  const answer = await withDeadline(promise, ms);
+// One store call to its deadline, after a keep-alive call: store calls do
+// not reset the worker's idle timer, and one may take most of the deadline.
+async function step<T>(call: () => Promise<T>, ms: number, keepAlive: () => void): Promise<T> {
+  keepAlive();
+  const answer = await withDeadline(call(), ms);
   if (answer === TIMED_OUT) {
     throw new StoreSilent();
   }
@@ -106,6 +105,11 @@ function stopReason(stop: WalkStop, inWindow: number): string | null {
 export async function runPass(deps: PassDeps): Promise<PassOutcome> {
   const { client, framework, limits = PASS_LIMITS, log = (line: string) => console.log(`[rex-spider-gemini] ${line}`) } = deps;
   try {
+    // rex-spider checks enabled when it queues the crawl; the served config
+    // may have switched the spider off while other spiders ran first.
+    if (!framework.isEnabled()) {
+      return { crawledCount: 0, crawledIds: [], reason: DISABLED, issue: null };
+    }
     const home = await client.get(HOME_URL);
     if (home.kind !== 'ok') {
       return failed(homepageUnreachable(home.kind));
@@ -124,16 +128,13 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     const unsent: GeminiRecord[] = [];
     const stopsBeforeSending = walk.stop !== null && ['not-a-list', 'timeout', 'network', 'disabled'].includes(walk.stop.kind);
     if (!stopsBeforeSending) {
-      for (const [index, item] of walk.items.entries()) {
-        if (index > 0 && index % KEEP_ALIVE_EVERY === 0) {
-          deps.keepAlive();
-        }
+      for (const item of walk.items) {
         const record = buildSummaryRecord(item);
-        if (!(await step(framework.crawlWindowContains(record.ended.timestamp()), limits.storeMs))) {
+        if (!(await step(() => framework.crawlWindowContains(record.ended.timestamp()), limits.storeMs, deps.keepAlive))) {
           continue;
         }
         crawledIds.push(item.id);
-        if (!(await step(framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), record.ended), limits.storeMs))) {
+        if (!(await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), record.ended), limits.storeMs, deps.keepAlive))) {
           unsent.push(record);
         }
       }
@@ -173,18 +174,23 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
         if (stampsStopped) {
           break;
         }
-        const stamped = await withDeadline(Promise.resolve().then(() => framework.logTransmitted(uploadKeyId(record.identifier, true), record.ended)), limits.storeMs);
-        if (stamped === TIMED_OUT) {
-          // Records sent from here on could not be stamped either, so none
-          // are: they go out next pass instead of twice.
-          log('the store did not answer a stamp; sending stops for this pass');
+        // A stamp that fails, or gets no answer, stops the stamping and the
+        // sending: records sent from here on could not be stamped either, so
+        // none are, and they go out next pass instead of twice. The records
+        // already sent stay counted.
+        try {
+          await step(() => framework.logTransmitted(uploadKeyId(record.identifier, true), record.ended), limits.storeMs, deps.keepAlive);
+        } catch (error) {
+          log(`a stamp ${error instanceof StoreSilent ? 'got no answer' : `failed (${error instanceof Error ? error.name : typeof error})`}; sending stops for this pass`);
           stampsStopped = true;
         }
       }
     }
     // The reason says how the list was read; how much went out is the count.
     // A pass that read the whole list says "Fetch successful." even when its
-    // sending stopped early: what it did not send goes out next pass.
+    // sending stopped early: what it did not send goes out next pass. A
+    // switch-off says so instead, whatever was read, so nothing counts a pass
+    // the config stopped as a full listing.
     if (disabled) {
       return { crawledCount: sent, crawledIds, reason: DISABLED, issue: null };
     }
