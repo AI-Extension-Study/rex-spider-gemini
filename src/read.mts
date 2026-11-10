@@ -1,16 +1,22 @@
 // One chat read, the hNvQHb RPC, reduced to what a record may carry: per
-// exchange its response id, its parent, its time, how many drafts the reply
-// had, and the kinds of any files attached to the prompt. Prompt and reply
-// text, file names, URLs, tokens and every other string in the payload are
-// never read out of it. Pure.
+// exchange its response id, the draft its prompt followed, the draft shown
+// for its reply, its time, how many drafts the reply had, the kinds of any
+// files attached to the prompt, and counts of the prompt's and the shown
+// reply's text, citations and search results. The prompt and the shown reply
+// are read only to be counted (count.mts); no text, file name, URL, token or
+// other string of the payload leaves this module. Pure.
 //
-// The positions come from structure captures of real reads (shapes and string
-// forms only): an exchange is [[chat id, response id], parent or null,
-// prompt, reply, [seconds, nanos]]; the parent is [chat id, previous response
-// id, previous draft id]; the reply's drafts are reply[0]; the prompt's files
-// are the list at prompt[0][4][0][3], each entry with its MIME type at [11]
-// (seen for one pasted image only). Exchanges come newest first, and a read
-// cut short carries a cursor in payload[1].
+// The positions come from structure captures of real reads (shapes, string
+// forms and counts only): an exchange is [[chat id, response id], parent or
+// null, prompt, reply, [seconds, nanos]]; the parent is [chat id, previous
+// response id, previous shown draft id]; the prompt's text is prompt[0][0]
+// and its files are the list at prompt[0][4][0][3], each entry with its MIME
+// type at [11] (prompt[0][4][0][4] lists the same files again); the reply's
+// drafts are reply[0], and the id of the one shown is reply[3]. A draft is
+// [id, [text], citations, ...], with its thoughts and tool calls at [37].
+// Exchanges come newest first, and a read cut short carries a cursor in
+// payload[1].
+import { type TextCounts, citationCount, countText, searchResultCount, withoutPlaceholderLinks } from './count.mts';
 import { isPlausibleSeconds } from './time.mts';
 import { rpcFrames } from './wire.mts';
 
@@ -25,6 +31,8 @@ export function readArgs(chatId: string): unknown[] {
 }
 
 const RESPONSE_ID = /^r_[0-9a-f]{16}$/;
+const DRAFT_ID = /^rc_[0-9a-f]{16}$/;
+const draftIdOrNull = (value: unknown): string | null => (typeof value === 'string' && DRAFT_ID.test(value) ? value : null);
 
 // The attachment kinds a record may name; any other MIME type is 'other',
 // since a type string is not checked further than this list.
@@ -32,14 +40,29 @@ export const ATTACHMENT_TYPES: ReadonlySet<string> = new Set([
   'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/heic', 'image/heif', 'application/pdf', 'text/plain', 'text/csv',
 ]);
 
+export interface ReplyCounts {
+  readonly text: TextCounts | null;
+  readonly citations: number | null;
+  readonly searchResults: number | null;
+}
+
 export interface Exchange {
   readonly responseId: string;
-  readonly parentId: string | null;
+  // The draft Gemini says the prompt followed: the previous exchange's shown
+  // reply. Null on the first exchange, or in another form.
+  readonly parentDraftId: string | null;
+  // The draft shown for the reply; null in another form.
+  readonly shownDraftId: string | null;
   readonly whenSec: number;
   readonly whenNanos: number;
   // Null when the reply has no draft list where one is expected.
   readonly drafts: number | null;
-  readonly attachmentTypes: readonly string[];
+  // Null when the prompt's file list has another form: the files are unknown.
+  readonly attachmentTypes: readonly string[] | null;
+  // Null when the prompt's text is not a string.
+  readonly prompt: TextCounts | null;
+  // Every count null when no draft has the shown id: the reply is unknown.
+  readonly reply: ReplyCounts;
 }
 
 export type ReadResult =
@@ -52,15 +75,53 @@ export type ReadResult =
 
 const at = (value: unknown, ...path: number[]): unknown => path.reduce<unknown>((node, index) => (Array.isArray(node) ? node[index] : undefined), value);
 
-function attachmentTypes(files: unknown): string[] {
-  if (!Array.isArray(files)) {
-    return [];
+// The kinds of the files attached to a prompt, from the list at
+// prompt[0][4][0][3]. None when a level of that path is null or absent: a
+// text-only prompt has an empty holder, or none at all (2 of 10 chats in the
+// third capture). Null when the prompt block is missing, or a level or a file
+// entry has another form, so a changed layout reads as unknown, not as no
+// files.
+function attachmentTypes(prompt: unknown): string[] | null {
+  const block = at(prompt, 0);
+  if (!Array.isArray(block)) {
+    return null;
+  }
+  let level: unknown = block;
+  for (const index of [4, 0, 3]) {
+    level = (level as unknown[])[index];
+    if (level === null || level === undefined) {
+      return [];
+    }
+    if (!Array.isArray(level)) {
+      return null;
+    }
+  }
+  const files = level as unknown[];
+  if (!files.every((file) => Array.isArray(file))) {
+    return null;
   }
   // An entry whose type string is missing or moved still counts, as other.
-  return files.filter((file) => Array.isArray(file)).map((file) => {
+  return files.map((file) => {
     const mime = at(file, 11);
     return typeof mime === 'string' && ATTACHMENT_TYPES.has(mime) ? mime : 'other';
   });
+}
+
+// The shown draft's counts. Its text is counted without placeholder links;
+// its thoughts, its tool results and the other drafts are not text.
+function replyCounts(drafts: unknown, shown: unknown): ReplyCounts {
+  // Found by the id as it is, so a draft id of a new length still gives its
+  // counts; only the id a record reports is held to the rc_ form.
+  const draft: unknown = typeof shown !== 'string' || !Array.isArray(drafts) ? undefined : drafts.find((candidate) => at(candidate, 0) === shown);
+  if (draft === undefined) {
+    return { text: null, citations: null, searchResults: null };
+  }
+  const text = at(draft, 1, 0);
+  return {
+    text: typeof text === 'string' ? countText(withoutPlaceholderLinks(text)) : null,
+    citations: citationCount(draft),
+    searchResults: searchResultCount(draft),
+  };
 }
 
 function readExchange(value: unknown, chatId: string): Exchange | null {
@@ -70,15 +131,19 @@ function readExchange(value: unknown, chatId: string): Exchange | null {
     return null;
   }
   const nanos = at(value, 4, 1);
-  const parentId = at(value, 1, 1);
   const drafts = at(value, 3, 0);
+  const shown = at(value, 3, 3);
+  const prompt = at(value, 2, 0, 0);
   return {
     responseId,
-    parentId: typeof parentId === 'string' && RESPONSE_ID.test(parentId) ? parentId : null,
+    parentDraftId: draftIdOrNull(at(value, 1, 2)),
+    shownDraftId: draftIdOrNull(shown),
     whenSec,
     whenNanos: Number.isInteger(nanos) && (nanos as number) >= 0 && (nanos as number) < 1e9 ? (nanos as number) : 0,
     drafts: Array.isArray(drafts) ? drafts.length : null,
-    attachmentTypes: attachmentTypes(at(value, 2, 0, 4, 0, 3)),
+    attachmentTypes: attachmentTypes(at(value, 2)),
+    prompt: typeof prompt === 'string' ? countText(prompt) : null,
+    reply: replyCounts(drafts, shown),
   };
 }
 

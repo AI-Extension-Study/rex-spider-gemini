@@ -11,7 +11,8 @@ const hex16 = (n: number) => n.toString(16).padStart(16, '0')
 const chat = (n: number) => `c_${hex16(n)}`
 const entry = (n: number, seconds: number) => [chat(n), `Title ${n}`, null, null, null, [seconds, 457522000], null, null, null, 1]
 // A chat read: one exchange, a minute before the chat's last message, laid
-// out as a real read (prompt text in [2], the reply's drafts in [3][0]).
+// out as a real read (the prompt block holding the text alone, as some
+// text-only prompts have, and the reply's drafts in [3][0]).
 const read = (n: number, seconds: number) => [[[[chat(n), `r_${hex16(n)}`], null, [[`Prompt ${n}`]], [[[`rc_${hex16(n)}`, [`Reply ${n}`]]], null, null, `rc_${hex16(n)}`], [seconds - 60, 457522000]]], null, null, []]
 // Whole seconds as a record's DateString serialises them.
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString().replace('.000Z', 'Z')
@@ -132,6 +133,7 @@ async function seedSummaryKeys(serviceWorker, chats: [number, number][]) {
 const summary = (n: number, seconds: number, ended: string) => ({
   name: 'rex-conversation',
   is_summary: true,
+  format_version: 1,
   date: seconds * 1000,
   identifier: chat(n),
   turns: [],
@@ -140,19 +142,29 @@ const summary = (n: number, seconds: number, ended: string) => ({
   metadata: entry(n, seconds),
 })
 
-// A detail record as the data-upload module receives it, every key: one turn,
-// and none of the read's text.
-const detail = (n: number, seconds: number) => ({
-  name: 'rex-conversation',
-  is_summary: false,
-  date: (seconds - 60) * 1000,
-  identifier: chat(n),
-  turns: [{ identifier: `r_${hex16(n)}`, parent: null, when: `${iso(seconds - 60).slice(0, -1)}.457522Z`, drafts: 1, attachments: 0, attachment_types: [] }],
-  platform: 'gemini',
-  ended: iso(seconds),
-  started: iso(seconds - 60),
-  metadata: entry(n, seconds),
-})
+// A detail record as the data-upload module receives it, every key: the
+// exchange's two turns, with counts of the read's text and none of the text.
+const detail = (n: number, seconds: number) => {
+  const when = `${iso(seconds - 60).slice(0, -1)}.457522Z`
+  return {
+    name: 'rex-conversation',
+    is_summary: false,
+    format_version: 1,
+    date: (seconds - 60) * 1000,
+    identifier: chat(n),
+    turns: [
+      { identifier: `r_${hex16(n)}`, parent: null, speaker: 'user', when, on_current_branch: true,
+        text_chars: `Prompt ${n}`.length, text_words: 2, citation_count: 0, search_result_count: 0, attachments: 0, attachment_types: [] },
+      { identifier: `rc_${hex16(n)}`, parent: `r_${hex16(n)}`, speaker: 'assistant', when, on_current_branch: true,
+        text_chars: `Reply ${n}`.length, text_words: 2, citation_count: 0, search_result_count: 0, attachments: 0, drafts: 1 },
+    ],
+    turns_complete: true,
+    platform: 'gemini',
+    ended: iso(seconds),
+    started: iso(seconds - 60),
+    metadata: entry(n, seconds),
+  }
+}
 
 const completions = (events) => events
   .filter((event) => event.event_name === 'rex-spider-gemini-complete')

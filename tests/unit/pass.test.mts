@@ -536,7 +536,7 @@ test('detail mode reads each unsent chat, newest first, and sends its detail rec
   const side = framework({ summarize: false });
   const run = await pass(fake, side);
   assert.deepEqual(readsOf(fake), [chatId(2), chatId(1)]);
-  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary, record.turns.length, record.date]), [[chatId(2), false, 1, (T - 60) * 1000], [chatId(1), false, 1, (T - 60) * 1000]]);
+  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary, record.turns.length, record.date]), [[chatId(2), false, 2, (T - 60) * 1000], [chatId(1), false, 2, (T - 60) * 1000]]);
   assert.deepEqual(side.stamped, [`${chatId(2)}-detail ${(T + 1) * 1000}`, `${chatId(1)}-detail ${T * 1000}`]);
   assert.deepEqual(run.outcome, { crawledCount: 2, crawledIds: [chatId(1), chatId(2)], reason: 'Fetch successful.', issue: null });
 });
