@@ -1,13 +1,14 @@
 // The Gemini case of the extension's content processor, which calls
 // redactGemini for platform 'gemini' on every rex-conversation point before
 // it is queued for upload. A record buildSummaryRecord or buildDetailRecord
-// made comes back as it went in, with the title at metadata[1] replaced by
-// the hash hashTitle gives, each field written from its checked value. Any
-// other event keeps only the scaffold: the fields the processor keeps for a
-// point of no known platform, each in its form. The case never rejects,
-// because rex-content-processing uploads a rejected processor's input
-// unredacted. The extension carries a copy of this file, made for the commit
-// its lockfile pins, so it imports nothing but rex-types. Pure.
+// made, in the standard record layout (format 1), comes back as it went in,
+// with the title at metadata[1] replaced by the hash hashTitle gives, each
+// field written from its checked value. Any other event keeps only the
+// scaffold: the fields the processor keeps for a point of no known platform,
+// each in its form. The case never rejects, because rex-content-processing
+// uploads a rejected processor's input unredacted. The extension carries a
+// copy of this file, made for the commit its lockfile pins, so it imports
+// nothing but rex-types. Pure.
 import { DateString } from '@bric/rex-types/types';
 
 const NAME = 'rex-conversation';
@@ -17,8 +18,13 @@ const PLATFORM = 'gemini';
 // length is left open, so a longer id still reads; hex carries no text.
 const CHAT_ID = /^c_[0-9a-f]{8,64}$/;
 const RESPONSE_ID = /^r_[0-9a-f]{8,64}$/;
+const DRAFT_ID = /^rc_[0-9a-f]{8,64}$/;
 export const isChatId = (value: unknown): value is string => typeof value === 'string' && CHAT_ID.test(value);
-const isResponseId = (value: unknown): value is string => typeof value === 'string' && RESPONSE_ID.test(value);
+// A turn's id or parent: an exchange's response id or a draft's id.
+const isTurnId = (value: unknown): value is string => typeof value === 'string' && (RESPONSE_ID.test(value) || DRAFT_ID.test(value));
+
+const FORMAT_VERSION = 1;
+const SPEAKERS: ReadonlySet<string> = new Set(['user', 'assistant']);
 
 // The form the scaffold keeps a name, a platform or a generator id in: PDK's
 // generator ids and the platform strings are lowercase words joined by
@@ -39,7 +45,7 @@ const SCAFFOLD: Readonly<Record<string, (value: unknown) => boolean>> = {
   _pdk_trace_context: (value) => value !== undefined,
   'passive-data-metadata': (value) => value !== undefined,
 };
-const FIELDS = [...Object.keys(SCAFFOLD), 'is_summary', 'turns', 'started', 'ended', 'metadata'];
+const FIELDS = [...Object.keys(SCAFFOLD), 'is_summary', 'format_version', 'turns', 'turns_complete', 'started', 'ended', 'metadata'];
 
 // The attachment kinds a turn may name: the read parser's (read.mts), and
 // 'other' for any other type.
@@ -50,6 +56,7 @@ export const ATTACHMENT_KINDS: ReadonlySet<string> = new Set([
 const isObject = (value: unknown): value is Readonly<Record<string, unknown>> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const has = (value: object, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const countOrNull = (value: unknown): number | null => (isCount(value) ? value : null);
 // Unix seconds from 2001 to 2286, the range the list and the read are held
 // to (time.mts).
 const isPlausibleSeconds = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 1e9 && value < 1e10;
@@ -142,17 +149,33 @@ async function keepEntry(entry: readonly unknown[], hashTitle: (title: unknown) 
   return kept;
 }
 
-// A turn as record.mts writes it, each key in its form; other keys dropped.
+// A turn as record.mts writes it: the standard keys in their order, each in
+// its form, then attachment_types on a user turn or drafts on an assistant
+// turn. Any other key is dropped, and a turn of another speaker keeps neither
+// extra.
 function keepTurn(turn: Readonly<Record<string, unknown>>): Record<string, unknown> {
-  const { identifier, parent, when, drafts, attachments, attachment_types: kinds } = turn;
-  return {
-    identifier: isResponseId(identifier) ? identifier : null,
-    parent: isResponseId(parent) ? parent : null,
+  const {
+    identifier, parent, speaker, when, on_current_branch: current, text_chars: chars, text_words: words,
+    citation_count: citations, search_result_count: results, attachments, attachment_types: kinds, drafts,
+  } = turn;
+  const kept: Record<string, unknown> = {
+    identifier: isTurnId(identifier) ? identifier : null,
+    parent: isTurnId(parent) ? parent : null,
+    speaker: typeof speaker === 'string' && SPEAKERS.has(speaker) ? speaker : null,
     when: instantOrNull(when),
-    drafts: isCount(drafts) ? drafts : null,
-    attachments: isCount(attachments) ? attachments : null,
-    attachment_types: Array.isArray(kinds) ? kinds.map((kind) => (typeof kind === 'string' && ATTACHMENT_KINDS.has(kind) ? kind : 'other')) : [],
+    on_current_branch: typeof current === 'boolean' ? current : null,
+    text_chars: countOrNull(chars),
+    text_words: countOrNull(words),
+    citation_count: countOrNull(citations),
+    search_result_count: countOrNull(results),
+    attachments: countOrNull(attachments),
   };
+  if (speaker === 'user') {
+    kept.attachment_types = Array.isArray(kinds) ? kinds.map((kind) => (typeof kind === 'string' && ATTACHMENT_KINDS.has(kind) ? kind : 'other')) : null;
+  } else if (speaker === 'assistant') {
+    kept.drafts = countOrNull(drafts);
+  }
+  return kept;
 }
 
 /** The record for a record record.mts built, else the scaffold; never rejects. */
@@ -160,11 +183,16 @@ export async function redactGemini(event: unknown, hashTitle: (title: unknown) =
   const fields = Object.fromEntries(FIELDS.map((key) => [key, readOwn(event, key)]));
   const scaffold = Object.fromEntries(Object.entries(SCAFFOLD).filter(([key, holds]) => holds(fields[key])).map(([key]) => [key, fields[key]]));
   try {
-    const { name, platform, identifier, date, is_summary: isSummary, turns, metadata, started } = fields;
-    if (name !== NAME || platform !== PLATFORM || !isChatId(identifier) || typeof isSummary !== 'boolean'
+    const { name, platform, identifier, date, is_summary: isSummary, format_version: version, turns, turns_complete: complete, metadata, started } = fields;
+    if (name !== NAME || platform !== PLATFORM || !isChatId(identifier) || typeof isSummary !== 'boolean' || version !== FORMAT_VERSION
       || !Array.isArray(turns) || (isSummary && turns.length !== 0) || !Array.isArray(metadata) || metadata[0] !== identifier) {
       return scaffold;
     }
+    // Only a detail record says whether its turns are complete.
+    if (isSummary ? complete !== undefined : typeof complete !== 'boolean') {
+      return scaffold;
+    }
+    const objects = turns.filter((turn) => isObject(turn));
     // ended is the list entry's last-message time, [seconds, nanos] at [5].
     const time: unknown = metadata[5];
     const listed: unknown = Array.isArray(time) ? time[0] : undefined;
@@ -188,7 +216,10 @@ export async function redactGemini(event: unknown, hashTitle: (title: unknown) =
     return {
       ...scaffold,
       is_summary: isSummary,
-      turns: turns.filter((turn) => isObject(turn)).map((turn) => keepTurn(turn)),
+      format_version: FORMAT_VERSION,
+      turns: objects.map((turn) => keepTurn(turn)),
+      // A turn dropped here leaves the turns incomplete.
+      ...(isSummary ? {} : { turns_complete: complete === true && objects.length === turns.length }),
       ended: new DateString(endedSec),
       ...(startedSec === null ? {} : { started: new DateString(startedSec) }),
       metadata: await keepEntry(metadata, hashTitle),

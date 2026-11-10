@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
+import { isDeepStrictEqual } from 'node:util';
 
 import { DateString } from '@bric/rex-types/types';
 
@@ -9,7 +10,7 @@ import { ATTACHMENT_TYPES, parseRead } from '../../src/read.mts';
 import { type GeminiRecord, buildDetailRecord, buildSummaryRecord } from '../../src/record.mts';
 import { ATTACHMENT_KINDS, redactGemini } from '../../src/redact.mts';
 import { batchResponse, chatId, listEntry, wrb } from './batch.mts';
-import { MARKER, draftId, exchange, readResponse } from './exchanges.mts';
+import { MARKER, citationSlot, draftId, exchange, readResponse, toolSlot } from './exchanges.mts';
 
 const T = 1700000000;
 const hash = async (title: unknown) => (typeof title === 'string' && title !== '' ? createHash('sha256').update(title).digest('hex') : null);
@@ -38,6 +39,10 @@ function detail(n: number, cursor: string | null = null): GeminiRecord {
   return buildDetailRecord(item(n), read as Extract<typeof read, { kind: 'read' }>);
 }
 
+// A standard turn's keys, in order; a user turn adds attachment_types and an
+// assistant turn drafts.
+const STANDARD_KEYS = ['identifier', 'parent', 'speaker', 'when', 'on_current_branch', 'text_chars', 'text_words', 'citation_count', 'search_result_count', 'attachments'];
+
 // What the record should come back as: itself, with the title's hash.
 async function hashed(record: GeminiRecord) {
   const expected = plain(record);
@@ -54,7 +59,7 @@ test('a summary record comes back as it went in, with the title replaced by its 
 
 test('a detail record comes back as it went in, with the title replaced by its hash', async () => {
   const record = detail(1);
-  assert.ok(record.started !== undefined && record.turns.length === 2, 'Test setup invalid: no start or no turns');
+  assert.ok(record.started !== undefined && record.turns.length === 4, 'Test setup invalid: no start, or not two turns for each of two exchanges');
   const out = await redactGemini(record, hash);
   assert.deepEqual(plain(out), await hashed(record));
   assert.ok(out.started instanceof DateString, 'started is not written as a DateString');
@@ -81,15 +86,21 @@ test('no text gets through: an extra key, or text in a turn field or a list posi
     ...record,
     title: MARKER,
     extra: { text: MARKER },
-    turns: [...record.turns.map((turn) => ({ ...turn, text: MARKER, when: MARKER, attachment_types: [MARKER, 'image/png'] })), MARKER, [MARKER]],
+    turns: [...record.turns.map((turn) => ({
+      ...turn, text: MARKER, when: MARKER, attachment_types: [MARKER, 'image/png'],
+      identifier: `${MARKER}`, parent: `rc_${MARKER}`, on_current_branch: MARKER,
+      text_chars: MARKER, text_words: MARKER, citation_count: MARKER, search_result_count: MARKER, attachments: MARKER, drafts: MARKER,
+    })), MARKER, [MARKER]],
     metadata,
   };
   const out = await redactGemini(loaded, hash);
   assert.equal(JSON.stringify(out).includes(MARKER), false, JSON.stringify(out));
   assert.equal(out.is_summary, false, 'a record with extra text was not kept as a record');
   const turns = out.turns as Record<string, unknown>[];
-  assert.equal(turns.length, 2, 'a turn that is not an object was kept');
-  assert.deepEqual(Object.keys(turns[0]), ['identifier', 'parent', 'when', 'drafts', 'attachments', 'attachment_types']);
+  assert.equal(turns.length, 4, 'a turn that is not an object was kept');
+  assert.equal(out.turns_complete, false, 'turns_complete stayed true after turns were dropped');
+  assert.deepEqual(Object.keys(turns[0]), [...STANDARD_KEYS, 'attachment_types']);
+  assert.deepEqual(Object.keys(turns[1]), [...STANDARD_KEYS, 'drafts'], 'an assistant turn kept a user turn\'s extra');
   assert.deepEqual([turns[0].when, turns[0].attachment_types], [null, ['other', 'image/png']]);
   assert.deepEqual((out.metadata as unknown[]).slice(2, 11), [null, null, null, [T, 457522000], [null, 3], [[1, null]], [null, [null]], 1, [[[null]]]]);
 });
@@ -117,11 +128,25 @@ test('a point that is not a record this module builds keeps only the scaffold', 
     ['a date that is not the record\'s', { ...summary, date: T * 1000 + 1 }, { ...scaffold, date: T * 1000 + 1 }],
     ['a start on a summary', { ...summary, started: new DateString(T - 60), date: (T - 60) * 1000 }, { ...scaffold, date: (T - 60) * 1000 }],
   ];
+  cases.push(
+    ['no format version', { ...summary, format_version: undefined }, scaffold],
+    ['another format version', { ...summary, format_version: 2 }, scaffold],
+    ['a format version as text', { ...summary, format_version: '1' }, scaffold],
+    ['turns_complete on a summary', { ...summary, turns_complete: true }, scaffold],
+  );
   const record = detail(1);
-  cases.push(['a start after the end', { ...record, started: new DateString(T + 60), date: (T + 60) * 1000 }, { ...scaffold, date: (T + 60) * 1000 }]);
+  const detailScaffold = { ...scaffold, date: (T - 120) * 1000 };
+  cases.push(
+    ['a start after the end', { ...record, started: new DateString(T + 60), date: (T + 60) * 1000 }, { ...scaffold, date: (T + 60) * 1000 }],
+    ['no turns_complete on a detail record', { ...record, turns_complete: undefined }, detailScaffold],
+    ['turns_complete that is not a flag', { ...record, turns_complete: 'yes' }, detailScaffold],
+  );
+  // Every case is checked before the test fails, so one break shows each case it lets through.
+  const wrong: string[] = [];
   for (const [what, event, expected] of cases) {
-    assert.deepEqual(plain(await redactGemini(event, hash)), expected, what);
+    if (!isDeepStrictEqual(plain(await redactGemini(event, hash)), expected)) wrong.push(what);
   }
+  assert.deepEqual(wrong, [], `kept more than the scaffold: ${wrong.join('; ')}`);
 });
 
 test('the scaffold keeps each field only in its form', async () => {
@@ -173,9 +198,40 @@ test('the attachment kinds a turn may name are the read parser\'s, and other', (
 
 test('each turn field is kept only in its form', async () => {
   const record = detail(1) as unknown as Record<string, unknown> & { turns: Record<string, unknown>[] };
-  const odd = { identifier: MARKER, parent: `r_${MARKER}`, when: '2023-11-14T22:13:20Z', drafts: -1, attachments: 1.5, attachment_types: 'image/png' };
-  const out = await redactGemini({ ...record, turns: [odd, record.turns[1]] }, hash);
-  assert.deepEqual((out.turns as unknown[])[0], { identifier: null, parent: null, when: '2023-11-14T22:13:20Z', drafts: null, attachments: null, attachment_types: [] });
+  const oddUser = {
+    identifier: MARKER, parent: `r_${MARKER}`, speaker: 'user', when: '2023-11-14T22:13:20Z', on_current_branch: 'yes',
+    text_chars: -1, text_words: 1.5, citation_count: '3', search_result_count: MARKER, attachments: 1.5, attachment_types: 'image/png', drafts: 2,
+  };
+  const oddAssistant = {
+    identifier: draftId(5), parent: draftId(4), speaker: 'assistant', when: MARKER, on_current_branch: false,
+    text_chars: 5, text_words: 0, citation_count: 2, search_result_count: 9, attachments: 0, drafts: -1, attachment_types: ['image/png'],
+  };
+  const other = { ...record.turns[0], speaker: 'system' };
+  // Numbers that are not counts: negative, fractional, unsafe.
+  const oddNumbers = { ...oddAssistant, when: '2023-11-14T22:13:20Z', citation_count: -1, search_result_count: 2.5, attachments: Number.MAX_SAFE_INTEGER + 2, drafts: 1.5 };
+  const out = await redactGemini({ ...record, turns: [oddUser, oddAssistant, other, oddNumbers] }, hash);
+  const [user, assistant, system, numbers] = out.turns as Record<string, unknown>[];
+  assert.deepEqual(user, {
+    identifier: null, parent: null, speaker: 'user', when: '2023-11-14T22:13:20Z', on_current_branch: null,
+    text_chars: null, text_words: null, citation_count: null, search_result_count: null, attachments: null, attachment_types: null,
+  });
+  assert.deepEqual([numbers.citation_count, numbers.search_result_count, numbers.attachments, numbers.drafts], [null, null, null, null]);
+  assert.deepEqual(assistant, {
+    identifier: draftId(5), parent: draftId(4), speaker: 'assistant', when: null, on_current_branch: false,
+    text_chars: 5, text_words: 0, citation_count: 2, search_result_count: 9, attachments: 0, drafts: null,
+  });
+  // A speaker outside the two is null, and such a turn keeps neither extra.
+  assert.deepEqual(system, { ...Object.fromEntries(STANDARD_KEYS.map((key) => [key, record.turns[0][key]])), speaker: null });
+});
+
+test('a detail record with counts from citations and search results comes back as it went in', async () => {
+  const read = parseRead(readResponse([
+    exchange({ chat: chatId(1), response: 2, parent: 1, seconds: T - 60, citations: citationSlot(7), tools: toolSlot([9, null]) }),
+    exchange({ chat: chatId(1), response: 1, seconds: T - 120, prompt: '' }),
+  ]), chatId(1));
+  assert.equal(read.kind, 'read', 'Test setup invalid: the read did not parse');
+  const record = buildDetailRecord(item(1), read as Extract<typeof read, { kind: 'read' }>);
+  assert.deepEqual(plain(await redactGemini(record, hash)), await hashed(record));
 });
 
 test('records of every shape the builders make come back as they went in', async () => {
@@ -185,6 +241,10 @@ test('records of every shape the builders make come back as they went in', async
   assert.equal(read.kind, 'read', 'Test setup invalid: the read did not parse');
   const noDrafts = read as Extract<typeof read, { kind: 'read' }>;
   cases.push(['drafts null, and a time with no nanoseconds', buildDetailRecord(item(1), { ...noDrafts, exchanges: noDrafts.exchanges.map((exchanged) => ({ ...exchanged, drafts: null })) })]);
+  cases.push(['null counts, ids and parent', buildDetailRecord(item(1), {
+    ...noDrafts,
+    exchanges: noDrafts.exchanges.map((exchanged) => ({ ...exchanged, parentDraftId: null, shownDraftId: null, attachmentTypes: null, prompt: null, reply: { text: null, citations: null, searchResults: null } })),
+  })]);
   cases.push(['the ten-position list entry', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: listEntry(1, T) })]);
   const sparse = entry(1);
   delete sparse[3];
