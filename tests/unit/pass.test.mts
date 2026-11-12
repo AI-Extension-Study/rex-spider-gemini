@@ -398,8 +398,9 @@ test('a pass never throws: a framework call that throws ends it with an error re
 test('enabled turning false stops the walk before its next list call, sends nothing and reports no reading', async () => {
   let calls = 0;
   const fake = client({ other: listPage(entries(1)), main: listPage(entries(2)) });
-  // Read once before the homepage, once before the first list call.
-  const side = framework({ enabled: () => (calls += 1) <= 2 });
+  // Read when the pass starts, again before the homepage, once before the
+  // first list call.
+  const side = framework({ enabled: () => (calls += 1) <= 3 });
   const run = await pass(fake, side);
   // -1, not 0: a count of 0 or more says crawledIds is a reading of the
   // chats in the window, and an empty one would read as an emptied account.
@@ -411,9 +412,9 @@ test('enabled turning false stops the walk before its next list call, sends noth
 
 test('enabled turning false stops sending before the next batch, and the list read stays reported', async () => {
   let checks = 0;
-  // The homepage and the two list calls read enabled once each; the first
-  // batch reads it fourth.
-  const side = framework({ enabled: () => (checks += 1) <= 4 });
+  // The pass start, the homepage and the two list calls read enabled once
+  // each; the first batch reads it fifth.
+  const side = framework({ enabled: () => (checks += 1) <= 5 });
   const run = await pass(client({ main: listPage(entries(3)) }), side, { batch: 2 });
   assert.deepEqual([run.outcome.crawledCount, run.outcome.crawledIds, run.outcome.reason, run.sent.map((record) => record.identifier)], [2, [chatId(1), chatId(2), chatId(3)], 'Crawl stopped: spider disabled.', [chatId(3), chatId(2)]]);
 });
@@ -421,6 +422,23 @@ test('enabled turning false stops sending before the next batch, and the list re
 test('a spider switched off before its pass begins makes no request and reports no reading', async () => {
   const fake = client({ main: listPage(entries(1)) });
   const run = await pass(fake, framework({ enabled: () => false }));
+  assert.deepEqual([run.outcome, fake.calls], [{ crawledCount: -1, crawledIds: [], reason: 'Crawl stopped: spider disabled.', issue: null }, []]);
+});
+
+test('a switch-off served while the mode record is read makes no request and reports no reading', async () => {
+  let switchedOff = false;
+  const fake = client({ main: listPage(entries(1)) });
+  const side = framework({ summarize: false, enabled: () => !switchedOff });
+  const store = fakeStore({ stored: { mode: 'detail', since: NOW - DAY } });
+  const { get } = store.mode;
+  // The refresh that switches the spider off lands while the read waits on
+  // the store, which can take up to the store's deadline.
+  store.mode.get = () => {
+    switchedOff = true;
+    return get();
+  };
+  const run = await pass(fake, side, {}, { store });
+  assert.deepEqual([store.counts.gets, store.counts.sets], [1, 0], 'Test setup invalid: the pass did not read the mode record once, or wrote it');
   assert.deepEqual([run.outcome, fake.calls], [{ crawledCount: -1, crawledIds: [], reason: 'Crawl stopped: spider disabled.', issue: null }, []]);
 });
 
@@ -743,8 +761,9 @@ test('a switch-off is read before the page token is read again, and again before
 
 test('a switch-off during the reads stops them before the next read, and the record sent last is stamped', async () => {
   let checks = 0;
-  // Read at the start, before each of the two list calls, then after each read's wait.
-  const side = framework({ summarize: false, enabled: () => (checks += 1) <= 4 });
+  // Read at the start, before the homepage, before each of the two list
+  // calls, then after each read's wait.
+  const side = framework({ summarize: false, enabled: () => (checks += 1) <= 5 });
   const fake = client({ main: listPage(entries(2)) });
   const run = await pass(fake, side);
   assert.deepEqual(readsOf(fake), [chatId(2)]);
