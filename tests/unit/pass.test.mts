@@ -679,7 +679,8 @@ test('a switch-off still ends the pass after the waits have passed the budget', 
 
 // The page token, read again from the homepage once it is 30 minutes old.
 const MINUTE = 60_000;
-const RENEWED: Answer = { kind: 'ok', status: 200, text: '<script>WIZ_global_data = {"SNlM0e":"PAGE-TOKEN:2"};</script>' };
+const RENEWED_PAGE = '<script>WIZ_global_data = {"SNlM0e":"PAGE-TOKEN:2"};</script>';
+const RENEWED: Answer = { kind: 'ok', status: 200, text: RENEWED_PAGE };
 // A pass's homepage reads and chat reads, each read with the token it carried.
 const tokenCalls = (fake: ReturnType<typeof client>) => fake.calls.filter((call) => !call.startsWith('list'))
   .map((call) => (call.startsWith('GET') ? 'homepage' : `read ${call.split(' ')[1]} ${/ at=(\S+)/.exec(call)?.[1]}`));
@@ -690,6 +691,15 @@ test('the page token is read again from the homepage before a read once it is ol
   const young = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
   await pass(young, framework({ summarize: false, crawlDelay: 7 * MINUTE }));
   assert.deepEqual(tokenCalls(young), ['homepage', ...newest(3, 3).map((id) => `read ${id} PAGE-TOKEN:1`)], 'under 30 minutes');
+  // At 10 minutes two reads go out at 20 and 30: a token exactly 30 minutes
+  // old is not read again.
+  const exact = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(2)) });
+  await pass(exact, framework({ summarize: false, crawlDelay: 10 * MINUTE }));
+  assert.deepEqual(tokenCalls(exact), ['homepage', ...newest(2, 2).map((id) => `read ${id} PAGE-TOKEN:1`)], 'exactly 30 minutes');
+  // A first read that takes 1 ms puts the second at 30 minutes and 1 ms.
+  const justPast = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(2)) });
+  await pass(justPast, framework({ summarize: false, crawlDelay: 10 * MINUTE }), {}, { readMs: 1 });
+  assert.deepEqual(tokenCalls(justPast), ['homepage', `read ${chatId(2)} PAGE-TOKEN:1`, 'homepage', `read ${chatId(1)} PAGE-TOKEN:2`], '30 minutes and 1 ms');
   // At 11 minutes they go out at 22, 33 and 44: the token is 33 minutes old
   // at the second read, and the one read then is 11 minutes old at the third.
   const old = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
@@ -700,7 +710,8 @@ test('the page token is read again from the homepage before a read once it is ol
 test('a page token that cannot be read again ends the reads, as an expired session does', async () => {
   const cases: [string, Answer][] = [
     ['signed out', { kind: 'ok', status: 200, text: '<html>Sign in</html>' }],
-    ['refused', { kind: 'ok', status: 403, text: '' }],
+    // The refusing page holds a token, so only its status can refuse it.
+    ['refused', { kind: 'ok', status: 403, text: RENEWED_PAGE }],
     ['no answer', { kind: 'timeout' }],
   ];
   for (const [what, answer] of cases) {
