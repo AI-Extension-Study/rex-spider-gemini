@@ -23,9 +23,10 @@ export const HOME_URL = 'https://gemini.google.com/app';
 // The rex-spider calls the pass makes. The window check reads the extension's
 // storage and the key calls rex-core's store, which never answers while its
 // database is not open, so each runs to a deadline. isEnabled is the served
-// config as of now, read before each request and each batch; justSummarize
-// is the served mode and continueAfterError the served halt_on_error, false
-// for true, each read once per pass.
+// config as of now, read before each request and each batch. justSummarize
+// is the served mode, read when the pass starts and again before each detail
+// read, since a detail pass can run for hours. continueAfterError is the
+// served halt_on_error, false for true, read at each failed detail read.
 export interface PassFramework {
   isEnabled(): boolean;
   justSummarize(): boolean;
@@ -51,18 +52,32 @@ export interface PassLimits {
   // that only storage that is not answering trips it, as the other REX
   // spiders' passes allow.
   readonly storeMs: number;
-  // The longest the detail reads of one pass may take, waits included.
-  // rex-spider runs its spiders one at a time, so a pass with hundreds of
-  // chats to read would hold the others back for hours. The chats it does not
-  // reach keep no key and are read in a later pass.
+  // The reading time the detail reads of one pass may take: requests,
+  // parsing and store calls, and not the paced waits between reads, as the
+  // project's other crawlers count it. On the wall clock the 30 s waits would
+  // end a pass at about 12 reads, and the first detail sweep of a heavy
+  // account would take many passes. Counted this way, the budget is what
+  // bounds a pass: about 360 s divided by the reading time per chat, in
+  // reads, each after its wait. If each chat takes 1 s, that is 360 reads and
+  // about 3 hours at the 30 s pace. A pass also ends once its unsent chats
+  // run out. The extension starts a crawl round every minute, and rex-spider
+  // skips a spider whose pass is still running, so the other spiders crawl
+  // alongside it from the next round on. The chats a pass does not reach keep
+  // no key and are read in a later pass.
   readonly detailBudgetMs: number;
   // Failed detail reads in a row that end a pass's reads when halt_on_error
   // is false: past a few, the reads are failing for a reason the next chats
   // share.
   readonly failedRun: number;
+  // The age past which the page token is read again from the homepage
+  // before the next detail read. How long Google keeps a token valid has not
+  // been measured, and a detail pass can run for hours. Reads made with one
+  // that had gone stale would fail, and their chats would get summaries and
+  // memos in place of detail records.
+  readonly tokenAgeMs: number;
 }
 
-export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000, failedRun: 3 };
+export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: 30 * 60 * 1000 };
 
 export interface PassDeps {
   readonly client: Pick<Client, 'get' | 'postForm'>;
@@ -138,8 +153,9 @@ interface Sending {
   readonly deps: PassDeps;
   readonly limits: PassLimits;
   readonly log: (line: string) => void;
-  // The page token.
+  // The page token, and when it was read from the homepage (epoch ms).
   readonly at: string;
+  readonly atRead: number;
 }
 
 interface Sent {
@@ -228,6 +244,19 @@ function readFailure(answer: Answer, read: Exclude<ReadResult, { kind: 'read' }>
   return read.kind === 'error' ? `error frame, code ${read.code}` : 'not a read';
 }
 
+// The page token from a homepage read again during the detail reads, or what
+// went wrong, for the log.
+function tokenFrom(home: Answer): { readonly at: string } | { readonly failure: string } {
+  if (home.kind !== 'ok') {
+    return { failure: home.kind };
+  }
+  if (home.status < 200 || home.status > 299) {
+    return { failure: `status ${home.status}` };
+  }
+  const at = pageToken(home.text);
+  return at === null ? { failure: 'no token' } : { at };
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // When a chat whose read failed is read again: a day after a first failure
@@ -257,10 +286,11 @@ async function memoKept(ctx: Sending, chatId: string, memo: DetailMemo): Promise
 const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 'stamp' ? stamped(ctx, due.record) : memoKept(ctx, due.chatId, due.memo));
 
 // Detail mode: each chat read in turn, crawl_delay apart and never closer
-// than the settle wait, until the detail budget is spent. The floor keeps a
-// served crawl_delay of 0, or one that is not a number, from firing reads
-// back to back. A record's key, or a failed read's memo, is written after
-// the wait before the next read, or after a settle wait at the end.
+// than the settle wait, until the reads have spent the detail budget, which
+// leaves out the waits between them. The floor keeps a served crawl_delay of
+// 0, or one that is not a number, from firing reads back to back. A record's
+// key, or a failed read's memo, is written after the wait before the next
+// read, or after a settle wait at the end.
 //
 // A failed read sends the chat's summary record in the detail's place, once
 // per last message, and writes a memo that holds the chat back until its
@@ -269,23 +299,32 @@ const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 
 // retry would never come. With halt_on_error the first failed read ends the
 // reads; without, failedRun of them in a row do, repeats included, so a read
 // that fails for every chat stops early even when most have memos. A chat
-// held back by its memo neither counts nor resets the run.
+// held back by its memo neither counts nor resets the run. halt_on_error is
+// read at each failed read, so a refresh that turns it on applies at the next.
 //
 // A rate limit (429) or an overloaded server (503) fails the read as one that
 // may pass, and also ends the reads, since the server asked to wait: under a
 // rate limit, one read per pass, and every chat still gets its summary. An
 // expired session ends the reads with no memo: it is not the chat's failure.
+// Summary mode served during the reads ends them too: the next pass sends in
+// summary, and the records already sent keep the keys they went out under.
+//
+// The page token is read again from the homepage before a read once it is
+// older than tokenAgeMs. A token that cannot be read again (signed out,
+// refused, no answer) ends the reads as an expired session does.
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
   const { client, framework, store } = deps;
-  const halts = !framework.continueAfterError();
+  let { at, atRead } = ctx;
   const started = deps.now();
+  // The time spent in the waits between reads, which the budget leaves out.
+  let waited = 0;
   let sent = 0;
   let failedInARow = 0;
   let stopped: 'failed' | 'wait' | null = null;
   let pending: Pending | null = null;
   for (const item of items) {
-    if (deps.now() - started >= limits.detailBudgetMs) {
+    if (deps.now() - started - waited >= limits.detailBudgetMs) {
       log('the detail budget is spent; the chats not read are read in a later pass');
       break;
     }
@@ -302,7 +341,12 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
     if (earlier !== null && earlier.at <= deps.now() + CLOCK_SKEW_MS && deps.now() < earlier.at + earlier.retryMs) {
       continue;
     }
+    // Measured on the clock rather than taken as the wait asked for, so a
+    // timer that fires late, or a clock change during the wait, does not
+    // count as reading either.
+    const waitFrom = deps.now();
     await deps.sleep(Math.max(paceMs(framework), limits.settleMs));
+    waited += deps.now() - waitFrom;
     if (pending !== null) {
       const due: Pending = pending;
       pending = null;
@@ -313,7 +357,25 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
     if (!framework.isEnabled()) {
       return { sent, disabled: true, stopped: null };
     }
-    const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), ctx.at));
+    if (framework.justSummarize()) {
+      log('summary mode was served during the detail reads; a later pass sends the chats not read');
+      break;
+    }
+    if (deps.now() - atRead > limits.tokenAgeMs) {
+      const token = tokenFrom(await client.get(HOME_URL));
+      if (!('at' in token)) {
+        log(`the page token could not be read again (${token.failure}); the chats not read are read in a later pass`);
+        break;
+      }
+      log('the page token was read again');
+      at = token.at;
+      atRead = deps.now();
+      // Enabled is read again for the read that follows, as before every request.
+      if (!framework.isEnabled()) {
+        return { sent, disabled: true, stopped: null };
+      }
+    }
+    const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), at));
     const read = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseRead(answer.text, item.id) : null;
     if (read !== null && read.kind === 'read') {
       failedInARow = 0;
@@ -366,6 +428,7 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       stopped = 'wait';
       break;
     }
+    const halts = !framework.continueAfterError();
     if (halts || failedInARow >= limits.failedRun) {
       log(halts ? 'a detail read failed and halt_on_error is set; the reads stop' : `${failedInARow} detail reads failed in a row; the reads stop`);
       stopped = 'failed';
@@ -387,7 +450,8 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (!framework.isEnabled()) {
       return SWITCHED_OFF;
     }
-    // Read once: a config refresh during the pass applies from the next one.
+    // The mode this pass sends in. Summary served during the detail reads
+    // ends them (sendDetails); any other change applies from the next pass.
     const served: Mode = framework.justSummarize() ? 'summary' : 'detail';
     // When this browser started running the served mode, recorded now if it
     // had not run it before (mode.mts). Each store call follows a keep-alive
@@ -406,6 +470,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     }, served, deps.now());
 
     const home = await client.get(HOME_URL);
+    const atRead = deps.now();
     if (home.kind !== 'ok') {
       return failed(homepageUnreachable(home.kind));
     }
@@ -450,7 +515,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
 
     // Newest first, so a pass cut short has sent the most recent chats.
     unsent.sort((a, b) => b.endedSec - a.endedSec);
-    const ctx: Sending = { deps, limits, log, at };
+    const ctx: Sending = { deps, limits, log, at, atRead };
     const { sent, disabled, stopped } = served === 'summary'
       ? await sendSummaries(ctx, unsent.map((item) => buildSummaryRecord(item)))
       : await sendDetails(ctx, unsent);

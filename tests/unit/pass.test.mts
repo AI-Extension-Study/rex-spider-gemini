@@ -22,18 +22,20 @@ const EXPIRED_READ: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wr
 // What a chat read answers unless a test scripts otherwise: one exchange, a
 // minute before the list's times.
 const readOf = (id: string): Answer => ({ kind: 'ok', status: 200, text: readResponse([exchange({ chat: id, response: 1, seconds: T - 60 })]) });
-const LIMITS = { settleMs: 1500, batch: 25, storeMs: 20, detailBudgetMs: 360_000, failedRun: 3 };
+const LIMITS = { settleMs: 1500, batch: 25, storeMs: 20, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: 30 * 60_000 };
 
 // The spider's two list calls answered by variant: [1,null,1] first, then the
 // main list [0,null,1], each a single page unless a cursor is scripted. A
-// chat read gets its scripted answer, or one exchange.
-function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Record<string, Answer>, reads = {} as Record<string, Answer> } = {}) {
+// chat read gets its scripted answer, or one exchange. A list of homepage
+// answers gives one per homepage read, the last one repeated.
+function client({ home = HOMEPAGE as Answer | Answer[], other = EMPTY, main = EMPTY, more = {} as Record<string, Answer>, reads = {} as Record<string, Answer> } = {}) {
   const calls: string[] = [];
+  const homes = Array.isArray(home) ? home : [home];
   return {
     calls,
     get: async (url: string): Promise<Answer> => {
       calls.push(`GET ${url}`);
-      return home;
+      return homes[Math.min(calls.filter((call) => call.startsWith('GET')).length, homes.length) - 1];
     },
     postForm: async (url: string, body: URLSearchParams): Promise<Answer> => {
       const [rpcid, json] = JSON.parse(body.get('f.req') ?? '')[0][0] as [string, string];
@@ -60,7 +62,7 @@ function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Rec
 // key stamped in this pass gets no answer; silentReadsAfter: every key read
 // after that many; rejectedReadsAfter: every key read after that many
 // rejects. haltOnError false is what the served configs say.
-function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false, enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
+function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false as boolean | (() => boolean), enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stampedNow = new Set<string>();
   const stamped: string[] = [];
@@ -69,7 +71,7 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
   const fw: PassFramework = {
     isEnabled: enabled,
     justSummarize: () => (typeof summarize === 'function' ? summarize() : summarize),
-    continueAfterError: () => !haltOnError,
+    continueAfterError: () => !(typeof haltOnError === 'function' ? haltOnError() : haltOnError),
     crawlWindowContains: async (ms) => {
       counts.windows += 1;
       return ms >= windowStart;
@@ -143,9 +145,12 @@ function fakeStore({ stored = null as ModeRecord | null, unanswered = false, mem
   };
 }
 
-// One pass with the fakes. The clock starts at now and moves only with the
-// waits, so a test can spend the detail budget.
-async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>, limits = {}, { store = fakeStore(), now = NOW, throwOn = null as string | null } = {}) {
+// One pass with the fakes. The clock starts at now and moves with the waits,
+// by readMs with each chat read, and by storeCallMs with each memo read and
+// stamp, so a test can spend the detail budget, which counts reading and not
+// the waits. slept gives how long a wait takes on the clock: what it asked
+// for, unless a test says otherwise.
+async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>, limits = {}, { store = fakeStore(), now = NOW, throwOn = null as string | null, readMs = 0, storeCallMs = 0, slept = (ms: number): number => Number(ms) || 0 } = {}) {
   const sent: GeminiRecord[] = [];
   const waits: number[] = [];
   let keepAlives = 0;
@@ -155,15 +160,27 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
       get: fake.get,
       postForm: (url, body) => {
         const [rpcid, json] = JSON.parse(body.get('f.req') ?? '')[0][0] as [string, string];
-        if (rpcid === 'hNvQHb') side.events.push(`read ${String((JSON.parse(json) as unknown[])[0])}`);
+        if (rpcid === 'hNvQHb') {
+          side.events.push(`read ${String((JSON.parse(json) as unknown[])[0])}`);
+          clock += readMs;
+        }
         return fake.postForm(url, body);
       },
     },
-    framework: side.fw,
+    framework: {
+      ...side.fw,
+      logTransmitted: (id, ended) => {
+        clock += storeCallMs;
+        return side.fw.logTransmitted(id, ended);
+      },
+    },
     store: {
       mode: store.mode,
       memo: {
-        get: (chatId) => store.memo.get(chatId),
+        get: (chatId) => {
+          clock += storeCallMs;
+          return store.memo.get(chatId);
+        },
         set: (chatId, memo) => {
           side.events.push(`memo ${chatId}`);
           return store.memo.set(chatId, memo);
@@ -183,7 +200,7 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
     sleep: async (ms) => {
       waits.push(ms);
       side.events.push(`wait ${ms}`);
-      clock += Number(ms) || 0;
+      clock += slept(ms);
     },
     keepAlive: () => {
       keepAlives += 1;
@@ -573,17 +590,155 @@ test('a crawl_delay shorter than the settle wait, or not a number, still leaves 
   }
 });
 
-test('the reads stop once the detail budget is spent, and the chats not reached keep no key', async () => {
-  const fake = client({ main: listPage(entries(5)) });
-  const side = framework({ summarize: false });
-  // Each read follows a 30 s wait. With 90 s, reads go out at 30, 60 and 90 s;
-  // a fourth would start its wait with the budget spent.
-  const run = await pass(fake, side, { detailBudgetMs: 90_000 });
-  assert.deepEqual(readsOf(fake), [chatId(5), chatId(4), chatId(3)]);
-  assert.deepEqual(keysOf(side), [`${chatId(5)}-detail`, `${chatId(4)}-detail`, `${chatId(3)}-detail`]);
-  // The record sent last waits out the settle time before its stamp.
-  assert.deepEqual(side.events.slice(-3), [`dispatch ${chatId(3)}`, 'wait 1500', `stamp ${chatId(3)}-detail`]);
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [3, 'Fetch successful.']);
+// The detail budget, 360 s here as in the spider, counts reading time only:
+// requests, parsing and store calls, never the waits between reads.
+// newest(count, n): the n newest chats of entries(count), in the order read.
+const newest = (count: number, n: number) => Array.from({ length: n }, (_, i) => chatId(count - i));
+
+test('the waits do not spend the detail budget: 20 chats at a 30 s crawl_delay are all read in one pass, and none outside the window', async () => {
+  // c_1 and c_2 are older than the window's start; c_3 to c_22 are in it.
+  const fake = client({ main: listPage(entries(22)) });
+  const side = framework({ summarize: false, crawlDelay: 30_000, windowStart: (T + 2) * 1000 });
+  const run = await pass(fake, side);
+  assert.deepEqual(readsOf(fake), newest(22, 20));
+  assert.deepEqual(keysOf(side), newest(22, 20).map((id) => `${id}-detail`));
+  // After the walk's wait, a 30 s wait before each read, 600 s in all and
+  // past the budget, then the settle wait before the last stamp.
+  assert.deepEqual(run.waits.slice(1), [...Array.from({ length: 20 }, () => 30_000), 1500]);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [20, 'Fetch successful.']);
+});
+
+test('the reads stop at the read that takes reading time to the detail budget or past it, and the chats not reached keep no key', async () => {
+  // Reads of 50 s: seven take 350 s and the eighth brings reading to 400 s,
+  // past the budget. Reads of 45 s: the eighth brings it to 360 s exactly.
+  // Either way no ninth goes out. On the wall clock, waits included, the
+  // budget would end the reads after five.
+  for (const readMs of [50_000, 45_000]) {
+    const fake = client({ main: listPage(entries(10)) });
+    const side = framework({ summarize: false, crawlDelay: 30_000 });
+    const run = await pass(fake, side, {}, { readMs });
+    assert.deepEqual(readsOf(fake), newest(10, 8), String(readMs));
+    assert.deepEqual(keysOf(side), newest(10, 8).map((id) => `${id}-detail`), String(readMs));
+    // The record sent last waits out the settle time before its stamp.
+    assert.deepEqual(side.events.slice(-3), [`dispatch ${chatId(3)}`, 'wait 1500', `stamp ${chatId(3)}-detail`], String(readMs));
+    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [8, 'Fetch successful.'], String(readMs));
+  }
+});
+
+test('store calls count as reading: memo reads and stamps of 30 s each end the reads after seven', async () => {
+  const fake = client({ main: listPage(entries(10)) });
+  const side = framework({ summarize: false, crawlDelay: 30_000 });
+  // The reads take no time. Each chat's memo read, and the stamp of the chat
+  // read before it, take 30 s each: reading is 330 s when the budget is
+  // checked before the seventh chat, and 390 s before the eighth.
+  const run = await pass(fake, side, {}, { storeCallMs: 30_000 });
+  assert.deepEqual(readsOf(fake), newest(10, 7));
+  assert.deepEqual(keysOf(side), newest(10, 7).map((id) => `${id}-detail`));
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [7, 'Fetch successful.']);
+});
+
+test('a wait that takes longer than it asked for counts as waiting, not reading', async () => {
+  const fake = client({ main: listPage(entries(10)) });
+  // Each 30 s wait takes 50 s on the clock, and each read 50 s: the reads
+  // stop after eight, as when the waits take what they ask for.
+  await pass(fake, framework({ summarize: false, crawlDelay: 30_000 }), {}, { readMs: 50_000, slept: (ms) => Number(ms) + 20_000 });
+  assert.deepEqual(readsOf(fake), newest(10, 8));
+});
+
+test('a wait counts as waiting for the time the clock shows, not the time it asked for', async () => {
+  const fake = client({ main: listPage(entries(10)) });
+  // Waits the clock shows as taking no time, as a clock set back during a
+  // wait can, and reads of 50 s: the reads still stop after eight.
+  await pass(fake, framework({ summarize: false, crawlDelay: 30_000 }), {}, { readMs: 50_000, slept: () => 0 });
+  assert.deepEqual(readsOf(fake), newest(10, 8));
+});
+
+test('a rate limit or an overloaded server still ends the reads at once after the waits have passed the budget', async () => {
+  const wait = 'Crawl stopped: the server asked to wait.';
+  for (const status of [429, 503]) {
+    // The 15th read, of c_6, is refused 450 s of waits into the reads.
+    const fake = client({ main: listPage(entries(20)), reads: { [chatId(6)]: { kind: 'ok', status, text: '' } } });
+    const run = await pass(fake, framework({ summarize: false, crawlDelay: 30_000 }));
+    assert.deepEqual(readsOf(fake), newest(20, 15), String(status));
+    // 14 detail records, and c_6's summary in its place.
+    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [15, wait, wait], String(status));
+  }
+});
+
+test('a switch-off still ends the pass after the waits have passed the budget', async () => {
+  const fake = client({ main: listPage(entries(20)) });
+  // The served config says enabled: false once 15 chats were read, 450 s of
+  // waits into the reads.
+  const side = framework({ summarize: false, crawlDelay: 30_000, enabled: () => readsOf(fake).length < 15 });
+  const run = await pass(fake, side);
+  assert.deepEqual(readsOf(fake), newest(20, 15));
+  // The record sent last is stamped after the wait, before the check that ends the pass.
+  assert.deepEqual(keysOf(side), newest(20, 15).map((id) => `${id}-detail`));
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [15, 'Crawl stopped: spider disabled.', null]);
+});
+
+// The page token, read again from the homepage once it is 30 minutes old.
+const MINUTE = 60_000;
+const RENEWED_PAGE = '<script>WIZ_global_data = {"SNlM0e":"PAGE-TOKEN:2"};</script>';
+const RENEWED: Answer = { kind: 'ok', status: 200, text: RENEWED_PAGE };
+// A pass's homepage reads and chat reads, each read with the token it carried.
+const tokenCalls = (fake: ReturnType<typeof client>) => fake.calls.filter((call) => !call.startsWith('list'))
+  .map((call) => (call.startsWith('GET') ? 'homepage' : `read ${call.split(' ')[1]} ${/ at=(\S+)/.exec(call)?.[1]}`));
+
+test('the page token is read again from the homepage before a read once it is older than 30 minutes, and not before', async () => {
+  // At a 7-minute crawl_delay the walk's wait ends at 7 minutes and the
+  // reads go out at 14, 21 and 28: the token never gets 30 minutes old.
+  const young = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  await pass(young, framework({ summarize: false, crawlDelay: 7 * MINUTE }));
+  assert.deepEqual(tokenCalls(young), ['homepage', ...newest(3, 3).map((id) => `read ${id} PAGE-TOKEN:1`)], 'under 30 minutes');
+  // At 10 minutes two reads go out at 20 and 30: a token exactly 30 minutes
+  // old is not read again.
+  const exact = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(2)) });
+  await pass(exact, framework({ summarize: false, crawlDelay: 10 * MINUTE }));
+  assert.deepEqual(tokenCalls(exact), ['homepage', ...newest(2, 2).map((id) => `read ${id} PAGE-TOKEN:1`)], 'exactly 30 minutes');
+  // A first read that takes 1 ms puts the second at 30 minutes and 1 ms.
+  const justPast = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(2)) });
+  await pass(justPast, framework({ summarize: false, crawlDelay: 10 * MINUTE }), {}, { readMs: 1 });
+  assert.deepEqual(tokenCalls(justPast), ['homepage', `read ${chatId(2)} PAGE-TOKEN:1`, 'homepage', `read ${chatId(1)} PAGE-TOKEN:2`], '30 minutes and 1 ms');
+  // At 11 minutes they go out at 22, 33 and 44: the token is 33 minutes old
+  // at the second read, and the one read then is 11 minutes old at the third.
+  const old = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  await pass(old, framework({ summarize: false, crawlDelay: 11 * MINUTE }));
+  assert.deepEqual(tokenCalls(old), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage', `read ${chatId(2)} PAGE-TOKEN:2`, `read ${chatId(1)} PAGE-TOKEN:2`], 'past 30 minutes');
+});
+
+test('a page token that cannot be read again ends the reads, as an expired session does', async () => {
+  const cases: [string, Answer][] = [
+    ['signed out', { kind: 'ok', status: 200, text: '<html>Sign in</html>' }],
+    // The refusing page holds a token, so only its status can refuse it.
+    ['refused', { kind: 'ok', status: 403, text: RENEWED_PAGE }],
+    ['no answer', { kind: 'timeout' }],
+  ];
+  for (const [what, answer] of cases) {
+    const fake = client({ home: [HOMEPAGE, answer], main: listPage(entries(3)) });
+    const side = framework({ summarize: false, crawlDelay: 11 * MINUTE });
+    const store = fakeStore();
+    const run = await pass(fake, side, {}, { store });
+    // Read again before the second read, which does not go out. The record
+    // sent before it is stamped first, and no chat gets a memo.
+    assert.deepEqual(tokenCalls(fake), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage'], what);
+    assert.deepEqual([side.events.slice(-2), store.memos.size], [[`wait ${11 * MINUTE}`, `stamp ${chatId(3)}-detail`], 0], what);
+    assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1), chatId(2), chatId(3)], reason: 'Fetch successful.', issue: null }, what);
+  }
+});
+
+test('a switch-off is read before the page token is read again, and again before the read after it', async () => {
+  // Switched off once c_3 was read: the token, 33 minutes old at c_2, is not
+  // read again.
+  const before = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  const first = await pass(before, framework({ summarize: false, crawlDelay: 11 * MINUTE, enabled: () => readsOf(before).length < 1 }));
+  assert.deepEqual(tokenCalls(before), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`], 'before the re-read');
+  assert.deepEqual([first.outcome.crawledCount, first.outcome.reason], [1, 'Crawl stopped: spider disabled.'], 'before the re-read');
+  // Switched off once the homepage was read a second time: c_2 is not read.
+  const during = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  const second = await pass(during, framework({ summarize: false, crawlDelay: 11 * MINUTE, enabled: () => tokenCalls(during).filter((call) => call === 'homepage').length < 2 }));
+  assert.deepEqual(tokenCalls(during), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage'], 'during the re-read');
+  assert.deepEqual([second.outcome.crawledCount, second.outcome.reason], [1, 'Crawl stopped: spider disabled.'], 'during the re-read');
 });
 
 test('a switch-off during the reads stops them before the next read, and the record sent last is stamped', async () => {
@@ -657,13 +812,28 @@ test('a dispatch that throws leaves its chat unstamped, and the reads go on', as
 });
 
 // The served mode, and the re-send after a change of mode.
-test('the served mode is read once, when the pass starts', async () => {
+test('a summary pass reads the served mode once, when it starts', async () => {
   let asked = 0;
   // Summary the first time it is asked, detail after.
   const side = framework({ summarize: () => (asked += 1) === 1 });
   const store = fakeStore();
   const run = await pass(client({ main: listPage(entries(2)) }), side, {}, { store });
   assert.deepEqual([asked, run.sent.map((record) => record.is_summary), store.writes], [1, [true, true], [{ mode: 'summary', since: NOW }]]);
+});
+
+test('summary mode served during the detail reads ends them, the records sent keep their detail keys, and the next pass sends in summary', async () => {
+  const fake = client({ main: listPage(entries(5)) });
+  // Detail when the pass starts; summary once three chats were read.
+  const side = framework({ summarize: () => readsOf(fake).length >= 3 });
+  const store = fakeStore();
+  const run = await pass(fake, side, {}, { store });
+  assert.deepEqual(readsOf(fake), newest(5, 3));
+  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary]), newest(5, 3).map((id) => [id, false]));
+  assert.deepEqual(keysOf(side), newest(5, 3).map((id) => `${id}-detail`));
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [3, 'Fetch successful.']);
+  // The switch re-sends in summary the chats last used in the 90 days before it.
+  const next = await pass(client({ main: listPage(entries(5)) }), side, {}, { store });
+  assert.deepEqual(next.sent.map((record) => [record.identifier, record.is_summary]), newest(5, 5).map((id) => [id, true]));
 });
 
 test('the switch to detail re-sends the chats last used in the 90 days before it, and older chats keep their summary', async () => {
@@ -805,6 +975,16 @@ test('halt_on_error true ends the reads at the first failed read', async () => {
   const run = await pass(fake, side);
   assert.deepEqual([readsOf(fake), side.events.slice(-2)], [[chatId(3)], ['wait 1500', `memo ${chatId(3)}`]]);
   assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1), chatId(2), chatId(3)], reason: STOPPED, issue: STOPPED });
+});
+
+test('halt_on_error served true during the reads makes the next failed read end them', async () => {
+  const fake = client({ main: listPage(entries(5)), reads: { [chatId(4)]: ERROR_READ, [chatId(2)]: ERROR_READ } });
+  // False until three chats were read: the reads go on past c_4's failure,
+  // and c_2's ends them, the first failure in its run.
+  const side = framework({ summarize: false, haltOnError: () => readsOf(fake).length >= 3 });
+  const run = await pass(fake, side);
+  assert.deepEqual(readsOf(fake), newest(5, 4));
+  assert.deepEqual([run.outcome.reason, run.outcome.issue], [STOPPED, STOPPED]);
 });
 
 test('halt_on_error false goes on past a failed read, and three in a row end the reads', async () => {
