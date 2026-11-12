@@ -53,14 +53,17 @@ export interface PassLimits {
   // spiders' passes allow.
   readonly storeMs: number;
   // The reading time the detail reads of one pass may take: requests,
-  // parsing and store calls. The paced waits between reads do not count. On
-  // the wall clock, at the 30 s crawl_delay, the budget would end a pass at
-  // about 12 reads, and the first detail sweep of a heavy account would take
-  // many passes with a sleep_delay between each. Counted this way, the sweep
-  // runs as one pass (90 chats take about 45 minutes of waits), and since
-  // rex-spider runs its spiders one at a time, the others wait until it ends.
-  // The project's other crawlers count their budget the same way. The chats
-  // a pass does not reach keep no key and are read in a later pass.
+  // parsing and store calls, and not the paced waits between reads, as the
+  // project's other crawlers count it. On the wall clock the 30 s waits would
+  // end a pass at about 12 reads, and the first detail sweep of a heavy
+  // account would take many passes. Counted this way, the budget is what
+  // bounds a pass: about 360 s divided by the reading time per chat, in
+  // reads, each after its wait. If each chat takes 1 s, that is 360 reads and
+  // about 3 hours at the 30 s pace. A pass also ends once its unsent chats
+  // run out. The extension starts a crawl round every minute, and rex-spider
+  // skips a spider whose pass is still running, so the other spiders crawl
+  // alongside it from the next round on. The chats a pass does not reach keep
+  // no key and are read in a later pass.
   readonly detailBudgetMs: number;
   // Failed detail reads in a row that end a pass's reads when halt_on_error
   // is false: past a few, the reads are failing for a reason the next chats
