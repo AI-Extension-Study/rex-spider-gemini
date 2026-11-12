@@ -22,18 +22,20 @@ const EXPIRED_READ: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wr
 // What a chat read answers unless a test scripts otherwise: one exchange, a
 // minute before the list's times.
 const readOf = (id: string): Answer => ({ kind: 'ok', status: 200, text: readResponse([exchange({ chat: id, response: 1, seconds: T - 60 })]) });
-const LIMITS = { settleMs: 1500, batch: 25, storeMs: 20, detailBudgetMs: 360_000, failedRun: 3 };
+const LIMITS = { settleMs: 1500, batch: 25, storeMs: 20, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: 30 * 60_000 };
 
 // The spider's two list calls answered by variant: [1,null,1] first, then the
 // main list [0,null,1], each a single page unless a cursor is scripted. A
-// chat read gets its scripted answer, or one exchange.
-function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Record<string, Answer>, reads = {} as Record<string, Answer> } = {}) {
+// chat read gets its scripted answer, or one exchange. A list of homepage
+// answers gives one per homepage read, the last one repeated.
+function client({ home = HOMEPAGE as Answer | Answer[], other = EMPTY, main = EMPTY, more = {} as Record<string, Answer>, reads = {} as Record<string, Answer> } = {}) {
   const calls: string[] = [];
+  const homes = Array.isArray(home) ? home : [home];
   return {
     calls,
     get: async (url: string): Promise<Answer> => {
       calls.push(`GET ${url}`);
-      return home;
+      return homes[Math.min(calls.filter((call) => call.startsWith('GET')).length, homes.length) - 1];
     },
     postForm: async (url: string, body: URLSearchParams): Promise<Answer> => {
       const [rpcid, json] = JSON.parse(body.get('f.req') ?? '')[0][0] as [string, string];
@@ -634,6 +636,59 @@ test('a switch-off still ends the pass after the waits have passed the budget', 
   // The record sent last is stamped after the wait, before the check that ends the pass.
   assert.deepEqual(keysOf(side), newest(20, 15).map((id) => `${id}-detail`));
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [15, 'Crawl stopped: spider disabled.', null]);
+});
+
+// The page token, read again from the homepage once it is 30 minutes old.
+const MINUTE = 60_000;
+const RENEWED: Answer = { kind: 'ok', status: 200, text: '<script>WIZ_global_data = {"SNlM0e":"PAGE-TOKEN:2"};</script>' };
+// A pass's homepage reads and chat reads, each read with the token it carried.
+const tokenCalls = (fake: ReturnType<typeof client>) => fake.calls.filter((call) => !call.startsWith('list'))
+  .map((call) => (call.startsWith('GET') ? 'homepage' : `read ${call.split(' ')[1]} ${/ at=(\S+)/.exec(call)?.[1]}`));
+
+test('the page token is read again from the homepage before a read once it is older than 30 minutes, and not before', async () => {
+  // At a 7-minute crawl_delay the walk's wait ends at 7 minutes and the
+  // reads go out at 14, 21 and 28: the token never gets 30 minutes old.
+  const young = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  await pass(young, framework({ summarize: false, crawlDelay: 7 * MINUTE }));
+  assert.deepEqual(tokenCalls(young), ['homepage', ...newest(3, 3).map((id) => `read ${id} PAGE-TOKEN:1`)], 'under 30 minutes');
+  // At 11 minutes they go out at 22, 33 and 44: the token is 33 minutes old
+  // at the second read, and the one read then is 11 minutes old at the third.
+  const old = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  await pass(old, framework({ summarize: false, crawlDelay: 11 * MINUTE }));
+  assert.deepEqual(tokenCalls(old), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage', `read ${chatId(2)} PAGE-TOKEN:2`, `read ${chatId(1)} PAGE-TOKEN:2`], 'past 30 minutes');
+});
+
+test('a page token that cannot be read again ends the reads, as an expired session does', async () => {
+  const cases: [string, Answer][] = [
+    ['signed out', { kind: 'ok', status: 200, text: '<html>Sign in</html>' }],
+    ['refused', { kind: 'ok', status: 403, text: '' }],
+    ['no answer', { kind: 'timeout' }],
+  ];
+  for (const [what, answer] of cases) {
+    const fake = client({ home: [HOMEPAGE, answer], main: listPage(entries(3)) });
+    const side = framework({ summarize: false, crawlDelay: 11 * MINUTE });
+    const store = fakeStore();
+    const run = await pass(fake, side, {}, { store });
+    // Read again before the second read, which does not go out. The record
+    // sent before it is stamped first, and no chat gets a memo.
+    assert.deepEqual(tokenCalls(fake), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage'], what);
+    assert.deepEqual([side.events.slice(-2), store.memos.size], [[`wait ${11 * MINUTE}`, `stamp ${chatId(3)}-detail`], 0], what);
+    assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1), chatId(2), chatId(3)], reason: 'Fetch successful.', issue: null }, what);
+  }
+});
+
+test('a switch-off is read before the page token is read again, and again before the read after it', async () => {
+  // Switched off once c_3 was read: the token, 33 minutes old at c_2, is not
+  // read again.
+  const before = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  const first = await pass(before, framework({ summarize: false, crawlDelay: 11 * MINUTE, enabled: () => readsOf(before).length < 1 }));
+  assert.deepEqual(tokenCalls(before), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`], 'before the re-read');
+  assert.deepEqual([first.outcome.crawledCount, first.outcome.reason], [1, 'Crawl stopped: spider disabled.'], 'before the re-read');
+  // Switched off once the homepage was read a second time: c_2 is not read.
+  const during = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  const second = await pass(during, framework({ summarize: false, crawlDelay: 11 * MINUTE, enabled: () => tokenCalls(during).filter((call) => call === 'homepage').length < 2 }));
+  assert.deepEqual(tokenCalls(during), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage'], 'during the re-read');
+  assert.deepEqual([second.outcome.crawledCount, second.outcome.reason], [1, 'Crawl stopped: spider disabled.'], 'during the re-read');
 });
 
 test('a switch-off during the reads stops them before the next read, and the record sent last is stamped', async () => {

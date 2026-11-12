@@ -66,9 +66,15 @@ export interface PassLimits {
   // is false: past a few, the reads are failing for a reason the next chats
   // share.
   readonly failedRun: number;
+  // The age past which the page token is read again from the homepage
+  // before the next detail read. How long Google keeps a token valid has not
+  // been measured, and a detail pass can run for hours. Reads made with one
+  // that had gone stale would fail, and their chats would get summaries and
+  // memos in place of detail records.
+  readonly tokenAgeMs: number;
 }
 
-export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000, failedRun: 3 };
+export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: 30 * 60 * 1000 };
 
 export interface PassDeps {
   readonly client: Pick<Client, 'get' | 'postForm'>;
@@ -144,8 +150,9 @@ interface Sending {
   readonly deps: PassDeps;
   readonly limits: PassLimits;
   readonly log: (line: string) => void;
-  // The page token.
+  // The page token, and when it was read from the homepage (epoch ms).
   readonly at: string;
+  readonly atRead: number;
 }
 
 interface Sent {
@@ -234,6 +241,19 @@ function readFailure(answer: Answer, read: Exclude<ReadResult, { kind: 'read' }>
   return read.kind === 'error' ? `error frame, code ${read.code}` : 'not a read';
 }
 
+// The page token from a homepage read again during the detail reads, or what
+// went wrong, for the log.
+function tokenFrom(home: Answer): { readonly at: string } | { readonly failure: string } {
+  if (home.kind !== 'ok') {
+    return { failure: home.kind };
+  }
+  if (home.status < 200 || home.status > 299) {
+    return { failure: `status ${home.status}` };
+  }
+  const at = pageToken(home.text);
+  return at === null ? { failure: 'no token' } : { at };
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // When a chat whose read failed is read again: a day after a first failure
@@ -285,9 +305,14 @@ const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 
 // expired session ends the reads with no memo: it is not the chat's failure.
 // Summary mode served during the reads ends them too: the next pass sends in
 // summary, and the records already sent keep the keys they went out under.
+//
+// The page token is read again from the homepage before a read once it is
+// older than tokenAgeMs. A token that cannot be read again (signed out,
+// refused, no answer) ends the reads as an expired session does.
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
   const { client, framework, store } = deps;
+  let { at, atRead } = ctx;
   const started = deps.now();
   // The time spent in the waits between reads, which the budget leaves out.
   let waited = 0;
@@ -333,7 +358,21 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       log('summary mode was served during the detail reads; a later pass sends the chats not read');
       break;
     }
-    const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), ctx.at));
+    if (deps.now() - atRead > limits.tokenAgeMs) {
+      const token = tokenFrom(await client.get(HOME_URL));
+      if (!('at' in token)) {
+        log(`the page token could not be read again (${token.failure}); the chats not read are read in a later pass`);
+        break;
+      }
+      log('the page token was read again');
+      at = token.at;
+      atRead = deps.now();
+      // Enabled is read again for the read that follows, as before every request.
+      if (!framework.isEnabled()) {
+        return { sent, disabled: true, stopped: null };
+      }
+    }
+    const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), at));
     const read = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseRead(answer.text, item.id) : null;
     if (read !== null && read.kind === 'read') {
       failedInARow = 0;
@@ -428,6 +467,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     }, served, deps.now());
 
     const home = await client.get(HOME_URL);
+    const atRead = deps.now();
     if (home.kind !== 'ok') {
       return failed(homepageUnreachable(home.kind));
     }
@@ -472,7 +512,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
 
     // Newest first, so a pass cut short has sent the most recent chats.
     unsent.sort((a, b) => b.endedSec - a.endedSec);
-    const ctx: Sending = { deps, limits, log, at };
+    const ctx: Sending = { deps, limits, log, at, atRead };
     const { sent, disabled, stopped } = served === 'summary'
       ? await sendSummaries(ctx, unsent.map((item) => buildSummaryRecord(item)))
       : await sendDetails(ctx, unsent);
