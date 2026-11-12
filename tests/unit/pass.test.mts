@@ -146,9 +146,11 @@ function fakeStore({ stored = null as ModeRecord | null, unanswered = false, mem
 }
 
 // One pass with the fakes. The clock starts at now and moves with the waits,
-// and by readMs with each chat read, so a test can spend the detail budget,
-// which counts the reads and not the waits.
-async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>, limits = {}, { store = fakeStore(), now = NOW, throwOn = null as string | null, readMs = 0 } = {}) {
+// by readMs with each chat read, and by storeCallMs with each memo read and
+// stamp, so a test can spend the detail budget, which counts reading and not
+// the waits. slept gives how long a wait takes on the clock: what it asked
+// for, unless a test says otherwise.
+async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>, limits = {}, { store = fakeStore(), now = NOW, throwOn = null as string | null, readMs = 0, storeCallMs = 0, slept = (ms: number): number => Number(ms) || 0 } = {}) {
   const sent: GeminiRecord[] = [];
   const waits: number[] = [];
   let keepAlives = 0;
@@ -165,11 +167,20 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
         return fake.postForm(url, body);
       },
     },
-    framework: side.fw,
+    framework: {
+      ...side.fw,
+      logTransmitted: (id, ended) => {
+        clock += storeCallMs;
+        return side.fw.logTransmitted(id, ended);
+      },
+    },
     store: {
       mode: store.mode,
       memo: {
-        get: (chatId) => store.memo.get(chatId),
+        get: (chatId) => {
+          clock += storeCallMs;
+          return store.memo.get(chatId);
+        },
         set: (chatId, memo) => {
           side.events.push(`memo ${chatId}`);
           return store.memo.set(chatId, memo);
@@ -189,7 +200,7 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
     sleep: async (ms) => {
       waits.push(ms);
       side.events.push(`wait ${ms}`);
-      clock += Number(ms) || 0;
+      clock += slept(ms);
     },
     keepAlive: () => {
       keepAlives += 1;
@@ -612,6 +623,34 @@ test('the reads stop at the read that takes reading time to the detail budget or
     assert.deepEqual(side.events.slice(-3), [`dispatch ${chatId(3)}`, 'wait 1500', `stamp ${chatId(3)}-detail`], String(readMs));
     assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [8, 'Fetch successful.'], String(readMs));
   }
+});
+
+test('store calls count as reading: memo reads and stamps of 30 s each end the reads after seven', async () => {
+  const fake = client({ main: listPage(entries(10)) });
+  const side = framework({ summarize: false, crawlDelay: 30_000 });
+  // The reads take no time. Each chat's memo read, and the stamp of the chat
+  // read before it, take 30 s each: reading is 330 s when the budget is
+  // checked before the seventh chat, and 390 s before the eighth.
+  const run = await pass(fake, side, {}, { storeCallMs: 30_000 });
+  assert.deepEqual(readsOf(fake), newest(10, 7));
+  assert.deepEqual(keysOf(side), newest(10, 7).map((id) => `${id}-detail`));
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [7, 'Fetch successful.']);
+});
+
+test('a wait that takes longer than it asked for counts as waiting, not reading', async () => {
+  const fake = client({ main: listPage(entries(10)) });
+  // Each 30 s wait takes 50 s on the clock, and each read 50 s: the reads
+  // stop after eight, as when the waits take what they ask for.
+  await pass(fake, framework({ summarize: false, crawlDelay: 30_000 }), {}, { readMs: 50_000, slept: (ms) => Number(ms) + 20_000 });
+  assert.deepEqual(readsOf(fake), newest(10, 8));
+});
+
+test('a wait counts as waiting for the time the clock shows, not the time it asked for', async () => {
+  const fake = client({ main: listPage(entries(10)) });
+  // Waits the clock shows as taking no time, as a clock set back during a
+  // wait can, and reads of 50 s: the reads still stop after eight.
+  await pass(fake, framework({ summarize: false, crawlDelay: 30_000 }), {}, { readMs: 50_000, slept: () => 0 });
+  assert.deepEqual(readsOf(fake), newest(10, 8));
 });
 
 test('a rate limit or an overloaded server still ends the reads at once after the waits have passed the budget', async () => {
