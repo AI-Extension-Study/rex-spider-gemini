@@ -51,10 +51,15 @@ export interface PassLimits {
   // that only storage that is not answering trips it, as the other REX
   // spiders' passes allow.
   readonly storeMs: number;
-  // The longest the detail reads of one pass may take, waits included.
-  // rex-spider runs its spiders one at a time, so a pass with hundreds of
-  // chats to read would hold the others back for hours. The chats it does not
-  // reach keep no key and are read in a later pass.
+  // The reading time the detail reads of one pass may take: requests,
+  // parsing and store calls. The paced waits between reads do not count. On
+  // the wall clock, at the 30 s crawl_delay, the budget would end a pass at
+  // about 12 reads, and the first detail sweep of a heavy account would take
+  // many passes with a sleep_delay between each. Counted this way, the sweep
+  // runs as one pass (90 chats take about 45 minutes of waits), and since
+  // rex-spider runs its spiders one at a time, the others wait until it ends.
+  // The project's other crawlers count their budget the same way. The chats
+  // a pass does not reach keep no key and are read in a later pass.
   readonly detailBudgetMs: number;
   // Failed detail reads in a row that end a pass's reads when halt_on_error
   // is false: past a few, the reads are failing for a reason the next chats
@@ -257,10 +262,11 @@ async function memoKept(ctx: Sending, chatId: string, memo: DetailMemo): Promise
 const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 'stamp' ? stamped(ctx, due.record) : memoKept(ctx, due.chatId, due.memo));
 
 // Detail mode: each chat read in turn, crawl_delay apart and never closer
-// than the settle wait, until the detail budget is spent. The floor keeps a
-// served crawl_delay of 0, or one that is not a number, from firing reads
-// back to back. A record's key, or a failed read's memo, is written after
-// the wait before the next read, or after a settle wait at the end.
+// than the settle wait, until the reads have spent the detail budget, which
+// leaves out the waits between them. The floor keeps a served crawl_delay of
+// 0, or one that is not a number, from firing reads back to back. A record's
+// key, or a failed read's memo, is written after the wait before the next
+// read, or after a settle wait at the end.
 //
 // A failed read sends the chat's summary record in the detail's place, once
 // per last message, and writes a memo that holds the chat back until its
@@ -280,12 +286,14 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
   const { client, framework, store } = deps;
   const halts = !framework.continueAfterError();
   const started = deps.now();
+  // The time spent in the waits between reads, which the budget leaves out.
+  let waited = 0;
   let sent = 0;
   let failedInARow = 0;
   let stopped: 'failed' | 'wait' | null = null;
   let pending: Pending | null = null;
   for (const item of items) {
-    if (deps.now() - started >= limits.detailBudgetMs) {
+    if (deps.now() - started - waited >= limits.detailBudgetMs) {
       log('the detail budget is spent; the chats not read are read in a later pass');
       break;
     }
@@ -302,7 +310,12 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
     if (earlier !== null && earlier.at <= deps.now() + CLOCK_SKEW_MS && deps.now() < earlier.at + earlier.retryMs) {
       continue;
     }
+    // Measured on the clock rather than taken as the wait asked for, so a
+    // timer that fires late, or a clock change during the wait, does not
+    // count as reading either.
+    const waitFrom = deps.now();
     await deps.sleep(Math.max(paceMs(framework), limits.settleMs));
+    waited += deps.now() - waitFrom;
     if (pending !== null) {
       const due: Pending = pending;
       pending = null;

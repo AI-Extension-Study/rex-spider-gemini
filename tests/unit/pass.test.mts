@@ -143,9 +143,10 @@ function fakeStore({ stored = null as ModeRecord | null, unanswered = false, mem
   };
 }
 
-// One pass with the fakes. The clock starts at now and moves only with the
-// waits, so a test can spend the detail budget.
-async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>, limits = {}, { store = fakeStore(), now = NOW, throwOn = null as string | null } = {}) {
+// One pass with the fakes. The clock starts at now and moves with the waits,
+// and by readMs with each chat read, so a test can spend the detail budget,
+// which counts the reads and not the waits.
+async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>, limits = {}, { store = fakeStore(), now = NOW, throwOn = null as string | null, readMs = 0 } = {}) {
   const sent: GeminiRecord[] = [];
   const waits: number[] = [];
   let keepAlives = 0;
@@ -155,7 +156,10 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
       get: fake.get,
       postForm: (url, body) => {
         const [rpcid, json] = JSON.parse(body.get('f.req') ?? '')[0][0] as [string, string];
-        if (rpcid === 'hNvQHb') side.events.push(`read ${String((JSON.parse(json) as unknown[])[0])}`);
+        if (rpcid === 'hNvQHb') {
+          side.events.push(`read ${String((JSON.parse(json) as unknown[])[0])}`);
+          clock += readMs;
+        }
         return fake.postForm(url, body);
       },
     },
@@ -573,17 +577,63 @@ test('a crawl_delay shorter than the settle wait, or not a number, still leaves 
   }
 });
 
-test('the reads stop once the detail budget is spent, and the chats not reached keep no key', async () => {
-  const fake = client({ main: listPage(entries(5)) });
-  const side = framework({ summarize: false });
-  // Each read follows a 30 s wait. With 90 s, reads go out at 30, 60 and 90 s;
-  // a fourth would start its wait with the budget spent.
-  const run = await pass(fake, side, { detailBudgetMs: 90_000 });
-  assert.deepEqual(readsOf(fake), [chatId(5), chatId(4), chatId(3)]);
-  assert.deepEqual(keysOf(side), [`${chatId(5)}-detail`, `${chatId(4)}-detail`, `${chatId(3)}-detail`]);
-  // The record sent last waits out the settle time before its stamp.
-  assert.deepEqual(side.events.slice(-3), [`dispatch ${chatId(3)}`, 'wait 1500', `stamp ${chatId(3)}-detail`]);
-  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [3, 'Fetch successful.']);
+// The detail budget, 360 s here as in the spider, counts reading time only:
+// requests, parsing and store calls, never the waits between reads.
+// newest(count, n): the n newest chats of entries(count), in the order read.
+const newest = (count: number, n: number) => Array.from({ length: n }, (_, i) => chatId(count - i));
+
+test('the waits do not spend the detail budget: 20 chats at a 30 s crawl_delay are all read in one pass, and none outside the window', async () => {
+  // c_1 and c_2 are older than the window's start; c_3 to c_22 are in it.
+  const fake = client({ main: listPage(entries(22)) });
+  const side = framework({ summarize: false, crawlDelay: 30_000, windowStart: (T + 2) * 1000 });
+  const run = await pass(fake, side);
+  assert.deepEqual(readsOf(fake), newest(22, 20));
+  assert.deepEqual(keysOf(side), newest(22, 20).map((id) => `${id}-detail`));
+  // After the walk's wait, a 30 s wait before each read, 600 s in all and
+  // past the budget, then the settle wait before the last stamp.
+  assert.deepEqual(run.waits.slice(1), [...Array.from({ length: 20 }, () => 30_000), 1500]);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [20, 'Fetch successful.']);
+});
+
+test('the reads stop at the read that takes reading time to the detail budget or past it, and the chats not reached keep no key', async () => {
+  // Reads of 50 s: seven take 350 s and the eighth brings reading to 400 s,
+  // past the budget. Reads of 45 s: the eighth brings it to 360 s exactly.
+  // Either way no ninth goes out. On the wall clock, waits included, the
+  // budget would end the reads after five.
+  for (const readMs of [50_000, 45_000]) {
+    const fake = client({ main: listPage(entries(10)) });
+    const side = framework({ summarize: false, crawlDelay: 30_000 });
+    const run = await pass(fake, side, {}, { readMs });
+    assert.deepEqual(readsOf(fake), newest(10, 8), String(readMs));
+    assert.deepEqual(keysOf(side), newest(10, 8).map((id) => `${id}-detail`), String(readMs));
+    // The record sent last waits out the settle time before its stamp.
+    assert.deepEqual(side.events.slice(-3), [`dispatch ${chatId(3)}`, 'wait 1500', `stamp ${chatId(3)}-detail`], String(readMs));
+    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [8, 'Fetch successful.'], String(readMs));
+  }
+});
+
+test('a rate limit or an overloaded server still ends the reads at once after the waits have passed the budget', async () => {
+  const wait = 'Crawl stopped: the server asked to wait.';
+  for (const status of [429, 503]) {
+    // The 15th read, of c_6, is refused 450 s of waits into the reads.
+    const fake = client({ main: listPage(entries(20)), reads: { [chatId(6)]: { kind: 'ok', status, text: '' } } });
+    const run = await pass(fake, framework({ summarize: false, crawlDelay: 30_000 }));
+    assert.deepEqual(readsOf(fake), newest(20, 15), String(status));
+    // 14 detail records, and c_6's summary in its place.
+    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [15, wait, wait], String(status));
+  }
+});
+
+test('a switch-off still ends the pass after the waits have passed the budget', async () => {
+  const fake = client({ main: listPage(entries(20)) });
+  // The served config says enabled: false once 15 chats were read, 450 s of
+  // waits into the reads.
+  const side = framework({ summarize: false, crawlDelay: 30_000, enabled: () => readsOf(fake).length < 15 });
+  const run = await pass(fake, side);
+  assert.deepEqual(readsOf(fake), newest(20, 15));
+  // The record sent last is stamped after the wait, before the check that ends the pass.
+  assert.deepEqual(keysOf(side), newest(20, 15).map((id) => `${id}-detail`));
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [15, 'Crawl stopped: spider disabled.', null]);
 });
 
 test('a switch-off during the reads stops them before the next read, and the record sent last is stamped', async () => {
