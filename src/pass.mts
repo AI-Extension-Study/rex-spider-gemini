@@ -23,9 +23,10 @@ export const HOME_URL = 'https://gemini.google.com/app';
 // The rex-spider calls the pass makes. The window check reads the extension's
 // storage and the key calls rex-core's store, which never answers while its
 // database is not open, so each runs to a deadline. isEnabled is the served
-// config as of now, read before each request and each batch; justSummarize
-// is the served mode and continueAfterError the served halt_on_error, false
-// for true, each read once per pass.
+// config as of now, read before each request and each batch. justSummarize
+// is the served mode, read when the pass starts and again before each detail
+// read, since a detail pass can run for hours. continueAfterError is the
+// served halt_on_error, false for true, read at each failed detail read.
 export interface PassFramework {
   isEnabled(): boolean;
   justSummarize(): boolean;
@@ -275,16 +276,18 @@ const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 
 // retry would never come. With halt_on_error the first failed read ends the
 // reads; without, failedRun of them in a row do, repeats included, so a read
 // that fails for every chat stops early even when most have memos. A chat
-// held back by its memo neither counts nor resets the run.
+// held back by its memo neither counts nor resets the run. halt_on_error is
+// read at each failed read, so a refresh that turns it on applies at the next.
 //
 // A rate limit (429) or an overloaded server (503) fails the read as one that
 // may pass, and also ends the reads, since the server asked to wait: under a
 // rate limit, one read per pass, and every chat still gets its summary. An
 // expired session ends the reads with no memo: it is not the chat's failure.
+// Summary mode served during the reads ends them too: the next pass sends in
+// summary, and the records already sent keep the keys they went out under.
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
   const { client, framework, store } = deps;
-  const halts = !framework.continueAfterError();
   const started = deps.now();
   // The time spent in the waits between reads, which the budget leaves out.
   let waited = 0;
@@ -325,6 +328,10 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
     }
     if (!framework.isEnabled()) {
       return { sent, disabled: true, stopped: null };
+    }
+    if (framework.justSummarize()) {
+      log('summary mode was served during the detail reads; a later pass sends the chats not read');
+      break;
     }
     const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), ctx.at));
     const read = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseRead(answer.text, item.id) : null;
@@ -379,6 +386,7 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       stopped = 'wait';
       break;
     }
+    const halts = !framework.continueAfterError();
     if (halts || failedInARow >= limits.failedRun) {
       log(halts ? 'a detail read failed and halt_on_error is set; the reads stop' : `${failedInARow} detail reads failed in a row; the reads stop`);
       stopped = 'failed';
@@ -400,7 +408,8 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (!framework.isEnabled()) {
       return SWITCHED_OFF;
     }
-    // Read once: a config refresh during the pass applies from the next one.
+    // The mode this pass sends in. Summary served during the detail reads
+    // ends them (sendDetails); any other change applies from the next pass.
     const served: Mode = framework.justSummarize() ? 'summary' : 'detail';
     // When this browser started running the served mode, recorded now if it
     // had not run it before (mode.mts). Each store call follows a keep-alive

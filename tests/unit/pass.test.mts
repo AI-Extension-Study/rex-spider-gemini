@@ -60,7 +60,7 @@ function client({ home = HOMEPAGE, other = EMPTY, main = EMPTY, more = {} as Rec
 // key stamped in this pass gets no answer; silentReadsAfter: every key read
 // after that many; rejectedReadsAfter: every key read after that many
 // rejects. haltOnError false is what the served configs say.
-function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false, enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
+function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false as boolean | (() => boolean), enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stampedNow = new Set<string>();
   const stamped: string[] = [];
@@ -69,7 +69,7 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
   const fw: PassFramework = {
     isEnabled: enabled,
     justSummarize: () => (typeof summarize === 'function' ? summarize() : summarize),
-    continueAfterError: () => !haltOnError,
+    continueAfterError: () => !(typeof haltOnError === 'function' ? haltOnError() : haltOnError),
     crawlWindowContains: async (ms) => {
       counts.windows += 1;
       return ms >= windowStart;
@@ -707,13 +707,28 @@ test('a dispatch that throws leaves its chat unstamped, and the reads go on', as
 });
 
 // The served mode, and the re-send after a change of mode.
-test('the served mode is read once, when the pass starts', async () => {
+test('a summary pass reads the served mode once, when it starts', async () => {
   let asked = 0;
   // Summary the first time it is asked, detail after.
   const side = framework({ summarize: () => (asked += 1) === 1 });
   const store = fakeStore();
   const run = await pass(client({ main: listPage(entries(2)) }), side, {}, { store });
   assert.deepEqual([asked, run.sent.map((record) => record.is_summary), store.writes], [1, [true, true], [{ mode: 'summary', since: NOW }]]);
+});
+
+test('summary mode served during the detail reads ends them, the records sent keep their detail keys, and the next pass sends in summary', async () => {
+  const fake = client({ main: listPage(entries(5)) });
+  // Detail when the pass starts; summary once three chats were read.
+  const side = framework({ summarize: () => readsOf(fake).length >= 3 });
+  const store = fakeStore();
+  const run = await pass(fake, side, {}, { store });
+  assert.deepEqual(readsOf(fake), newest(5, 3));
+  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary]), newest(5, 3).map((id) => [id, false]));
+  assert.deepEqual(keysOf(side), newest(5, 3).map((id) => `${id}-detail`));
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [3, 'Fetch successful.']);
+  // The switch re-sends in summary the chats last used in the 90 days before it.
+  const next = await pass(client({ main: listPage(entries(5)) }), side, {}, { store });
+  assert.deepEqual(next.sent.map((record) => [record.identifier, record.is_summary]), newest(5, 5).map((id) => [id, true]));
 });
 
 test('the switch to detail re-sends the chats last used in the 90 days before it, and older chats keep their summary', async () => {
@@ -855,6 +870,16 @@ test('halt_on_error true ends the reads at the first failed read', async () => {
   const run = await pass(fake, side);
   assert.deepEqual([readsOf(fake), side.events.slice(-2)], [[chatId(3)], ['wait 1500', `memo ${chatId(3)}`]]);
   assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1), chatId(2), chatId(3)], reason: STOPPED, issue: STOPPED });
+});
+
+test('halt_on_error served true during the reads makes the next failed read end them', async () => {
+  const fake = client({ main: listPage(entries(5)), reads: { [chatId(4)]: ERROR_READ, [chatId(2)]: ERROR_READ } });
+  // False until three chats were read: the reads go on past c_4's failure,
+  // and c_2's ends them, the first failure in its run.
+  const side = framework({ summarize: false, haltOnError: () => readsOf(fake).length >= 3 });
+  const run = await pass(fake, side);
+  assert.deepEqual(readsOf(fake), newest(5, 4));
+  assert.deepEqual([run.outcome.reason, run.outcome.issue], [STOPPED, STOPPED]);
 });
 
 test('halt_on_error false goes on past a failed read, and three in a row end the reads', async () => {
