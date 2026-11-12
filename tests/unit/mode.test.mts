@@ -83,9 +83,24 @@ test('a chat sent in the served mode at this time needs nothing', async () => {
   assert.equal(await sentAlready('c_1', at(ended), 'detail', SWITCH, keys(['c_1-detail', ended])), true);
 });
 
+test('a chat holding keys in both modes at this time, as every re-sent chat does, needs nothing', async () => {
+  const ended = SWITCH - 3 * DAY;
+  const both = keys(['c_1', ended], ['c_1-detail', ended]);
+  for (const served of ['detail', 'summary'] as const) {
+    assert.equal(await sentAlready('c_1', at(ended), served, SWITCH, both), true, served);
+  }
+});
+
 test('a chat never sent at this time is sent', async () => {
   const ended = SWITCH - 10 * DAY;
   assert.equal(await sentAlready('c_1', at(ended), 'detail', SWITCH, keys(['c_1', ended - 1000])), false);
+});
+
+test('a chat with no key in either mode is sent, however long before the switch it was last used', async () => {
+  const ended = SWITCH - 120 * DAY;
+  for (const served of ['detail', 'summary'] as const) {
+    assert.equal(await sentAlready('c_1', at(ended), served, SWITCH, keys()), false, served);
+  }
 });
 
 test('a chat sent in the other mode and last used within 90 days before the switch is sent again', async () => {

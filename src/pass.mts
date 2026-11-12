@@ -468,6 +468,12 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
         },
       },
     }, served, deps.now());
+    // The mode record's read, and its write when there is one, can each take
+    // up to the store's deadline. A refresh in that time may have switched the
+    // spider off, so enabled is read again before the first request.
+    if (!framework.isEnabled()) {
+      return SWITCHED_OFF;
+    }
 
     const home = await client.get(HOME_URL);
     const atRead = deps.now();
