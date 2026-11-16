@@ -39,8 +39,8 @@
         "test:ui": "playwright test --ui"
     },
     "dependencies": {
-        "@bric/rex-core": "github:bric-digital/rex-core",
-        "@bric/rex-spider": "github:bric-digital/rex-spider"
+        "@bric/rex-core": "github:bric-digital/rex-core#e7cd111aad3dd5bd2e103414c3488f8169d2b0d1",
+        "@bric/rex-spider": "github:bric-digital/rex-spider#774e813d6d39e00c7f166c013b5c205303e8a33b"
     },
     "devDependencies": {
         "@types/node": "^24.19.2"
