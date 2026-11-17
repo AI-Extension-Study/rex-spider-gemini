@@ -28,8 +28,8 @@ export const HOME_URL = 'https://gemini.google.com/app';
 // is the served mode, read when the pass starts and again before each detail
 // read, since a detail pass can run for hours. continueAfterError is the
 // served halt_on_error, false for true, read at each failed detail read.
-// account is the served account block (account.mts), read when the pass
-// starts.
+// account is the served account block (account.mts), read after the
+// homepage, and again with isEnabled after the wait before the account call.
 export interface PassFramework {
   account(): AccountSettings;
   isEnabled(): boolean;
@@ -451,7 +451,7 @@ function accountFailure(answer: Answer): string {
   if (answer.kind !== 'ok') {
     return answer.kind;
   }
-  if (answer.status < 200 || answer.status > 299) {
+  if (answer.status !== 200) {
     return `status ${answer.status}`;
   }
   return bardErrorCodes(answer.text).includes(1096) ? 'expired session' : 'not an answer';
@@ -460,14 +460,14 @@ function accountFailure(answer: Answer): string {
 // The account read (account.mts), between the page token and the walk: off
 // unless served on, and made once the interval has passed. One ESY5D call,
 // crawl_delay after the homepage, and crawl_delay again before the walk's
-// first call, which also leaves a sent record time to be stored before its
-// state is. Whatever it meets (a rate limit, an expired session, an answer
+// first call, never less than the settle wait, so a sent record is stored
+// before its state is. Only an HTTP 200 carrying the flag is an answer. Whatever it meets (a rate limit, an expired session, an answer
 // that is not the flag, an error), the pass goes on as if it were not there:
 // it sets no reason, issue or count, and nothing is sent without the flag.
 // After the call, the read time is stored, even when building or sending the
 // record failed, so the call waits out the interval; the record's hash and
 // send time are stored only when it was sent.
-async function readAccount(deps: PassDeps, at: string, log: (line: string) => void): Promise<void> {
+async function readAccount(deps: PassDeps, at: string, limits: PassLimits, log: (line: string) => void): Promise<void> {
   const { client, framework, store } = deps;
   try {
     const settings = framework.account();
@@ -484,14 +484,16 @@ async function readAccount(deps: PassDeps, at: string, log: (line: string) => vo
       return;
     }
     await deps.sleep(paceMs(framework));
-    if (!framework.isEnabled()) {
+    // A refresh during the wait may have switched the spider or the account
+    // read off.
+    if (!framework.isEnabled() || !framework.account().enabled) {
       return;
     }
     const answer = await client.postForm(batchUrl(ACCOUNT_RPC, deps.requestId), batchBody(ACCOUNT_RPC, ACCOUNT_ARGS, at));
     const readAt = deps.now();
     let next: AccountState = { hash: stored.value?.hash ?? '', sentAt: stored.value?.sentAt ?? 0, readAt };
     try {
-      const historySaved = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseActivity(answer.text) : null;
+      const historySaved = answer.kind === 'ok' && answer.status === 200 ? parseActivity(answer.text) : null;
       if (answer.kind !== 'ok' || historySaved === null) {
         log(`the account read failed (${accountFailure(answer)}); nothing is sent`);
       } else {
@@ -505,7 +507,7 @@ async function readAccount(deps: PassDeps, at: string, log: (line: string) => vo
     } catch (error) {
       log(`the account record was not sent (${kindOf(error)})`);
     }
-    await deps.sleep(paceMs(framework));
+    await deps.sleep(Math.max(paceMs(framework), limits.settleMs));
     touch(deps.keepAlive, log);
     if (!(await store.account.set(next)).ok) {
       log('the account state was not kept');
@@ -561,7 +563,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
       return failed(NO_TOKEN);
     }
 
-    await readAccount(deps, at, log);
+    await readAccount(deps, at, limits, log);
 
     const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at, requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
 

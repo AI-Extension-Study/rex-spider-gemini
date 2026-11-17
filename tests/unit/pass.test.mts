@@ -207,7 +207,13 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
     },
     store: {
       mode: store.mode,
-      account: store.account,
+      account: {
+        get: () => store.account.get(),
+        set: (state) => {
+          side.events.push('account state');
+          return store.account.set(state);
+        },
+      },
       memo: {
         get: (chatId) => {
           clock += storeCallMs;
@@ -1188,13 +1194,14 @@ const READ_AT = NOW + 30_000;
 
 test('with the account read off, a pass makes today\'s calls and waits and never touches the account state', async () => {
   for (const account of [undefined, { enabled: false, intervalMinutes: 15 }]) {
+    const label = String(JSON.stringify(account));
     const fake = client({ main: listPage(entries(1)) });
     const side = framework(account === undefined ? {} : { account });
     const store = fakeStore();
     const run = await pass(fake, side, {}, { store });
-    assert.deepEqual(fake.calls, ['GET https://gemini.google.com/app', ...LIST_CALLS], JSON.stringify(account));
-    assert.deepEqual(side.events, ['wait 30000', `dispatch ${chatId(1)}`, 'wait 1500', `stamp ${chatId(1)}`], JSON.stringify(account));
-    assert.deepEqual([run.accounts, store.counts.accountGets, store.counts.accountSets], [[], 0, 0], JSON.stringify(account));
+    assert.deepEqual(fake.calls, ['GET https://gemini.google.com/app', ...LIST_CALLS], label);
+    assert.deepEqual(side.events, ['wait 30000', `dispatch ${chatId(1)}`, 'wait 1500', `stamp ${chatId(1)}`], label);
+    assert.deepEqual([run.accounts, store.counts.accountGets, store.counts.accountSets], [[], 0, 0], label);
   }
 });
 
@@ -1206,7 +1213,7 @@ test('on, the account is read once after the page token, crawl_delay before and 
   assert.deepEqual(fake.calls, ['GET https://gemini.google.com/app', ACCOUNT_CALL, ...LIST_CALLS]);
   // The wait before the account call, the one before the walk, then the
   // walk's own between its two list calls.
-  assert.deepEqual(side.events, ['wait 30000', 'account', 'dispatch rex-account', 'wait 30000', 'wait 30000', `dispatch ${chatId(1)}`, 'wait 1500', `stamp ${chatId(1)}`]);
+  assert.deepEqual(side.events, ['wait 30000', 'account', 'dispatch rex-account', 'wait 30000', 'account state', 'wait 30000', `dispatch ${chatId(1)}`, 'wait 1500', `stamp ${chatId(1)}`]);
   assert.deepEqual(run.accounts, [accountRecord(true, READ_AT)]);
   assert.deepEqual(store.accountWrites, [{ hash: await accountHash(run.accounts[0]), sentAt: READ_AT, readAt: READ_AT }]);
   assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1)], reason: 'Fetch successful.', issue: null });
@@ -1245,6 +1252,8 @@ test('on, a failed call or an answer that is not the flag sends nothing, stores 
     ['an expired session', { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wrb.fr","ESY5D",null,null,null,[16],"generic",[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1096]]]]]\n` }],
     ['an error frame', { kind: 'ok', status: 200, text: batchResponse(wrbError('ESY5D', 3)) }],
     ['a reshaped flag', activity('yes')],
+    ['500 with the flag in its body', { kind: 'ok', status: 500, text: batchResponse(wrb('ESY5D', [[null, null, null, null, true]])) }],
+    ['206 with the flag in its body', { kind: 'ok', status: 206, text: batchResponse(wrb('ESY5D', [[null, null, null, null, true]])) }],
   ];
   for (const [what, account] of cases) {
     const fake = client({ main: listPage(entries(2)), account });
@@ -1332,4 +1341,35 @@ test('on, an error after the account call still stores the read time, so the cal
   const run = await pass(client({ main: listPage(entries(1)) }), framework({ account: ON }), {}, { store });
   assert.deepEqual([run.accounts, store.accountWrites, run.outcome.reason], [[], [{ hash: '', sentAt: 0, readAt: READ_AT }], 'Fetch successful.']);
   assert.ok(run.lines.some((line) => line.includes('(TypeError)')), run.lines.join('\n'));
+});
+
+test('on, the account read switched off during the wait before its call makes no call and stores nothing', async () => {
+  let settings: AccountSettings = ON;
+  const side = framework();
+  side.fw.account = () => settings;
+  const fake = client({ main: listPage(entries(1)) });
+  const store = fakeStore();
+  // The first wait of the pass is the one before the account call.
+  const run = await pass(fake, side, {}, { store, slept: (ms) => {
+    settings = { enabled: false, intervalMinutes: 60 };
+    return Number(ms) || 0;
+  } });
+  assert.deepEqual([accountCalls(fake), run.accounts, store.accountWrites, run.outcome.reason], [[], [], [], 'Fetch successful.']);
+});
+
+test('on, with a crawl_delay of 0 the account state is still written a settle wait after its record', async () => {
+  const side = framework({ account: ON, crawlDelay: 0 });
+  await pass(client({ main: listPage(entries(1)) }), side);
+  const from = side.events.indexOf('dispatch rex-account');
+  assert.deepEqual(side.events.slice(from, from + 3), ['dispatch rex-account', 'wait 1500', 'account state'], side.events.join(', '));
+});
+
+test('on, an account state the store does not keep is logged by its kind alone, and the pass goes on as with the read off', async () => {
+  const off = await pass(client({ main: listPage(entries(1)) }), framework());
+  const store = fakeStore();
+  store.account.set = async () => ({ ok: false, unanswered: false });
+  const run = await pass(client({ main: listPage(entries(1)) }), framework({ account: ON }), {}, { store });
+  assert.deepEqual([run.outcome, run.sent], [off.outcome, off.sent]);
+  assert.ok(run.lines.includes('the account state was not kept'), run.lines.join('\n'));
+  assert.ok(run.lines.every((line) => !/[0-9a-f]{64}|PAGE-TOKEN|ESY5D/.test(line)), run.lines.join('\n'));
 });

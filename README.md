@@ -11,6 +11,8 @@ The Gemini crawler for a research browser extension (this fork of bric-digital's
 | per chat | id (`c_` and hex), the last message's time, and the chat's list entry | the same, plus `started`, the first exchange's time, when the read returned the whole chat |
 | per exchange | nothing | two turns, the prompt's and the shown reply's, with counts (below) |
 
+With the served `account` setting on (off by default), it also sends an account record: whether Gemini Apps Activity is on (see "The account record").
+
 Never collected: message text (only counts), the reply's other drafts (only how many there were), thinking, tool results, file names or contents (only their types), links, and which model answered.
 
 ## How a pass works
@@ -53,11 +55,11 @@ Each mode has its own upload key: the bare chat id in summary mode, the key earl
 
 ## The account record
 
-Off unless the served configuration turns it on (see "Settings it reads"). When on, a pass reads Gemini Apps Activity once the interval has passed since the last read, or when the stored read time is more than 5 minutes ahead of the clock (the clock moved back). The read is one `ESY5D` call to `/_/BardChatUi/data/batchexecute` with `[null,[5]]`, after the page token and before the list, with `crawl_delay` before it and again before the first list call. It answers `[[null,null,null,null,true]]` with activity on and `false` with it off.
+Off unless the served configuration turns it on (see "Settings it reads"). When on, a pass reads Gemini Apps Activity once the interval has passed since the last read, or when the stored read time is more than 5 minutes ahead of the clock (the clock moved back). The read is one `ESY5D` call to `/_/BardChatUi/data/batchexecute` with `[null,[5]]`, after the page token and before the list, with `crawl_delay` before it and again before the first list call (never less than 3 s). It answers `[[null,null,null,null,true]]` with activity on and `false` with it off.
 
 The record is a `rex-account` point of its own, in the account record layout the AI crawlers share (format 1): `name` (`rex-account`), `platform` (`gemini`), `format_version` (`1`), `date` (the read, epoch ms), then `plan`, `paid`, `workspace`, `web_search_enabled`, `training_allowed`, `history_saved`, `memory_enabled`, `custom_instructions_set`, `account_created`, `source_status` and `metadata`. Gemini fills only `history_saved` (activity on or off; with it off Gemini keeps no chats); the other standard keys are null, `source_status` is `{"ESY5D": <HTTP status>}` and `metadata` is `{}`.
 
-A record goes out when the call answered the flag, and it differs from the last one sent, or that one went out 24 hours ago or more (or more than 5 minutes ahead of the clock). A rate limit, a failed call, an expired session or any other answer sends nothing. Either way the read time is stored under `rex-spider-gemini-account` (with the last record's hash and send time), so the next read comes an interval later. The account read never changes a pass's reason, count or issues.
+A record goes out when the call answered HTTP 200 with the flag, and it differs from the last one sent, or that one went out 24 hours ago or more (or more than 5 minutes ahead of the clock). Any other status, a rate limit, a failed call, an expired session or any other answer sends nothing. Once the call is made, whatever it answered, the read time is stored under `rex-spider-gemini-account` (with the last record's hash and send time), so the next read comes an interval later. No call is made, and nothing is stored, when the stored state gets no answer, or when the spider or the account read is switched off during the wait before the call. The account read never changes a pass's reason, count or issues.
 
 ## What is removed, and how
 
