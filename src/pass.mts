@@ -6,6 +6,7 @@
 // It never throws: every outcome is a reason.
 import type { DateString } from '@bric/rex-types/types';
 
+import { ACCOUNT_ARGS, ACCOUNT_RPC, type AccountRecord, type AccountSettings, type AccountState, accountDue, accountHash, buildGeminiAccount, parseActivity, shouldSend } from './account.mts';
 import { type Answer, type Client } from './client.mts';
 import { uploadKeyId } from './keys.mts';
 import { type ListItem } from './list.mts';
@@ -27,7 +28,10 @@ export const HOME_URL = 'https://gemini.google.com/app';
 // is the served mode, read when the pass starts and again before each detail
 // read, since a detail pass can run for hours. continueAfterError is the
 // served halt_on_error, false for true, read at each failed detail read.
+// account is the served account block (account.mts), read when the pass
+// starts.
 export interface PassFramework {
+  account(): AccountSettings;
   isEnabled(): boolean;
   justSummarize(): boolean;
   continueAfterError(): boolean;
@@ -82,12 +86,12 @@ export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_
 export interface PassDeps {
   readonly client: Pick<Client, 'get' | 'postForm'>;
   readonly framework: PassFramework;
-  // rex-core's store, for the mode record (mode.mts) and the memos of
-  // failed detail reads.
-  readonly store: Pick<GeminiStore, 'mode' | 'memo'>;
+  // rex-core's store, for the mode record (mode.mts), the memos of failed
+  // detail reads and the account read's state.
+  readonly store: Pick<GeminiStore, 'mode' | 'memo' | 'account'>;
   // Epoch ms.
   readonly now: () => number;
-  readonly dispatch: (record: GeminiRecord) => void;
+  readonly dispatch: (record: GeminiRecord | AccountRecord) => void;
   readonly sleep: (ms: number) => Promise<void>;
   readonly keepAlive: () => unknown;
   readonly requestId: number;
@@ -442,6 +446,75 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
   return { sent, disabled: false, stopped };
 }
 
+// What went wrong with the account call, for the log, never the answer's text.
+function accountFailure(answer: Answer): string {
+  if (answer.kind !== 'ok') {
+    return answer.kind;
+  }
+  if (answer.status < 200 || answer.status > 299) {
+    return `status ${answer.status}`;
+  }
+  return bardErrorCodes(answer.text).includes(1096) ? 'expired session' : 'not an answer';
+}
+
+// The account read (account.mts), between the page token and the walk: off
+// unless served on, and made once the interval has passed. One ESY5D call,
+// crawl_delay after the homepage, and crawl_delay again before the walk's
+// first call, which also leaves a sent record time to be stored before its
+// state is. Whatever it meets (a rate limit, an expired session, an answer
+// that is not the flag, an error), the pass goes on as if it were not there:
+// it sets no reason, issue or count, and nothing is sent without the flag.
+// After the call, the read time is stored, even when building or sending the
+// record failed, so the call waits out the interval; the record's hash and
+// send time are stored only when it was sent.
+async function readAccount(deps: PassDeps, at: string, log: (line: string) => void): Promise<void> {
+  const { client, framework, store } = deps;
+  try {
+    const settings = framework.account();
+    if (!settings.enabled) {
+      return;
+    }
+    touch(deps.keepAlive, log);
+    const stored = await store.account.get();
+    if (stored.unanswered) {
+      log('the account state got no answer; the account is read in a later pass');
+      return;
+    }
+    if (!accountDue(stored.value, deps.now(), settings.intervalMinutes)) {
+      return;
+    }
+    await deps.sleep(paceMs(framework));
+    if (!framework.isEnabled()) {
+      return;
+    }
+    const answer = await client.postForm(batchUrl(ACCOUNT_RPC, deps.requestId), batchBody(ACCOUNT_RPC, ACCOUNT_ARGS, at));
+    const readAt = deps.now();
+    let next: AccountState = { hash: stored.value?.hash ?? '', sentAt: stored.value?.sentAt ?? 0, readAt };
+    try {
+      const historySaved = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseActivity(answer.text) : null;
+      if (answer.kind !== 'ok' || historySaved === null) {
+        log(`the account read failed (${accountFailure(answer)}); nothing is sent`);
+      } else {
+        const record = buildGeminiAccount(answer.status, historySaved, readAt);
+        const hash = await accountHash(record);
+        if (shouldSend(stored.value, hash, readAt)) {
+          deps.dispatch(record);
+          next = { hash, sentAt: readAt, readAt };
+        }
+      }
+    } catch (error) {
+      log(`the account record was not sent (${kindOf(error)})`);
+    }
+    await deps.sleep(paceMs(framework));
+    touch(deps.keepAlive, log);
+    if (!(await store.account.set(next)).ok) {
+      log('the account state was not kept');
+    }
+  } catch (error) {
+    log(`the account read ended on an internal error (${kindOf(error)})`);
+  }
+}
+
 export async function runPass(deps: PassDeps): Promise<PassOutcome> {
   const { client, framework, limits = PASS_LIMITS, log = (line: string) => console.log(`[rex-spider-gemini] ${line}`) } = deps;
   try {
@@ -487,6 +560,8 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     if (at === null) {
       return failed(NO_TOKEN);
     }
+
+    await readAccount(deps, at, log);
 
     const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at, requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
 

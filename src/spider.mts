@@ -4,6 +4,7 @@
 import rexCorePlugin, { dispatchEvent } from '@bric/rex-core/service-worker';
 import { REXSpider, type REXSpiderCrawlResult } from '@bric/rex-spider/service-worker';
 
+import { type AccountSettings, accountSettings } from './account.mts';
 import { createClient } from './client.mts';
 import { HOME_URL, runPass } from './pass.mts';
 import { sleep } from './pacing.mts';
@@ -33,6 +34,10 @@ export class REXGeminiSpider extends REXSpider {
   // own flag only ever turns off.
   haltsOnError = true;
 
+  // The served account block as of the last config refresh: off unless it
+  // says enabled true (account.mts).
+  accountServed: AccountSettings = accountSettings(undefined);
+
   // rex-spider calls this on each refresh whose config has a block for this
   // spider or a default one. With neither, the mode last served stays until
   // the worker restarts, as enabled does.
@@ -40,6 +45,13 @@ export class REXGeminiSpider extends REXSpider {
     super.updateConfiguration(configuration);
     this.summarizes = configuration.summarize === true;
     this.haltsOnError = configuration.halt_on_error !== false;
+    // rex-spider's configuration type has no account key, so the served
+    // block is read as unknown and checked in account.mts.
+    this.accountServed = accountSettings('account' in configuration ? configuration.account : undefined);
+  }
+
+  account(): AccountSettings {
+    return this.accountServed;
   }
 
   justSummarize(): boolean {
@@ -116,7 +128,7 @@ export class REXGeminiSpider extends REXSpider {
       store: this.store,
       now: () => Date.now(),
       // A shallow copy: rex-core's EventPayload has an index signature that
-      // the record's interface does not.
+      // the records' interfaces do not.
       dispatch: (record) => dispatchEvent({ ...record }),
       sleep: (ms) => sleep(ms, { keepAlive }),
       keepAlive,
