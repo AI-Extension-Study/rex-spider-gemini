@@ -3,11 +3,13 @@ import { test } from 'node:test';
 
 import { type DateString } from '@bric/rex-types/types';
 
+import { type AccountRecord, type AccountSettings, type AccountState, accountHash } from '../../src/account.mts';
 import { type Answer } from '../../src/client.mts';
 import { type PassFramework, runPass } from '../../src/pass.mts';
 import { parseRead } from '../../src/read.mts';
 import { type GeminiRecord } from '../../src/record.mts';
 import { type DetailMemo, type ModeRecord } from '../../src/store.mts';
+import { batchBody, batchUrl } from '../../src/wire.mts';
 import { batchResponse, chatId, listEntry, wrb, wrbError } from './batch.mts';
 import { exchange, readResponse } from './exchanges.mts';
 
@@ -22,13 +24,16 @@ const EXPIRED_READ: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wr
 // What a chat read answers unless a test scripts otherwise: one exchange, a
 // minute before the list's times.
 const readOf = (id: string): Answer => ({ kind: 'ok', status: 200, text: readResponse([exchange({ chat: id, response: 1, seconds: T - 60 })]) });
+// What the account call (ESY5D) answers: Gemini Apps Activity on or off.
+const activity = (on: unknown): Answer => ({ kind: 'ok', status: 200, text: batchResponse(wrb('ESY5D', [[null, null, null, null, on]])) });
 const LIMITS = { settleMs: 1500, batch: 25, storeMs: 20, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: 30 * 60_000 };
 
 // The spider's two list calls answered by variant: [1,null,1] first, then the
 // main list [0,null,1], each a single page unless a cursor is scripted. A
 // chat read gets its scripted answer, or one exchange. A list of homepage
-// answers gives one per homepage read, the last one repeated.
-function client({ home = HOMEPAGE as Answer | Answer[], other = EMPTY, main = EMPTY, more = {} as Record<string, Answer>, reads = {} as Record<string, Answer> } = {}) {
+// answers gives one per homepage read, the last one repeated. The account
+// call gets its scripted answer, or activity on.
+function client({ home = HOMEPAGE as Answer | Answer[], other = EMPTY, main = EMPTY, more = {} as Record<string, Answer>, reads = {} as Record<string, Answer>, account = activity(true) } = {}) {
   const calls: string[] = [];
   const homes = Array.isArray(home) ? home : [home];
   return {
@@ -41,6 +46,10 @@ function client({ home = HOMEPAGE as Answer | Answer[], other = EMPTY, main = EM
       const [rpcid, json] = JSON.parse(body.get('f.req') ?? '')[0][0] as [string, string];
       const args = JSON.parse(json) as unknown[];
       const reqid = url.slice(url.indexOf('_reqid='));
+      if (rpcid === 'ESY5D') {
+        calls.push(`account ${url} ${body.toString()}`);
+        return account;
+      }
       if (rpcid === 'hNvQHb') {
         const id = String(args[0]);
         calls.push(`read ${id} ${json} rpcids=${new URL(url).searchParams.get('rpcids')} at=${body.get('at')} ${reqid}`);
@@ -61,14 +70,16 @@ function client({ home = HOMEPAGE as Answer | Answer[], other = EMPTY, main = EM
 // logTransmitted resolves after a failed write. silentReadBacks: a read of a
 // key stamped in this pass gets no answer; silentReadsAfter: every key read
 // after that many; rejectedReadsAfter: every key read after that many
-// rejects. haltOnError false is what the served configs say.
-function framework({ windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false as boolean | (() => boolean), enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
+// rejects. haltOnError false is what the served configs say. account: the
+// served account read, off unless a test turns it on.
+function framework({ account = { enabled: false, intervalMinutes: 60 } as AccountSettings, windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false as boolean | (() => boolean), enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stampedNow = new Set<string>();
   const stamped: string[] = [];
   const events: string[] = [];
   const counts = { windows: 0, reads: 0, stampTries: 0 };
   const fw: PassFramework = {
+    account: () => account,
     isEnabled: enabled,
     justSummarize: () => (typeof summarize === 'function' ? summarize() : summarize),
     continueAfterError: () => !(typeof haltOnError === 'function' ? haltOnError() : haltOnError),
@@ -101,16 +112,33 @@ function framework({ windowStart = 0, held = [] as [string, number][], silentRea
 // rex-core's store as the pass sees it (store.mts): the mode record and the
 // memos of failed reads. unanswered: mode reads get no answer;
 // memoUnanswered: memo reads get none; memoUnkept: memo writes fail;
-// malformed: chats whose memo holds something that is not a memo.
-function fakeStore({ stored = null as ModeRecord | null, unanswered = false, memos = {} as Record<string, DetailMemo>, memoUnanswered = false, memoUnkept = false, malformed = [] as string[] } = {}) {
+// malformed: chats whose memo holds something that is not a memo;
+// accountState: the stored account state; accountUnanswered: its reads get
+// no answer.
+function fakeStore({ stored = null as ModeRecord | null, unanswered = false, memos = {} as Record<string, DetailMemo>, memoUnanswered = false, memoUnkept = false, malformed = [] as string[], accountState = null as AccountState | null, accountUnanswered = false } = {}) {
   let value = stored;
+  let accountValue = accountState;
   const writes: ModeRecord[] = [];
+  const accountWrites: AccountState[] = [];
   const book = new Map(Object.entries(memos));
-  const counts = { gets: 0, sets: 0, memoGets: 0, memoSets: 0, memoClears: 0 };
+  const counts = { gets: 0, sets: 0, memoGets: 0, memoSets: 0, memoClears: 0, accountGets: 0, accountSets: 0 };
   return {
     writes,
+    accountWrites,
     counts,
     memos: book,
+    account: {
+      get: async () => {
+        counts.accountGets += 1;
+        return { value: accountUnanswered ? null : accountValue, unanswered: accountUnanswered, malformed: false };
+      },
+      set: async (state: AccountState) => {
+        counts.accountSets += 1;
+        accountWrites.push(state);
+        accountValue = state;
+        return { ok: true, unanswered: false };
+      },
+    },
     memo: {
       get: async (chatId: string) => {
         counts.memoGets += 1;
@@ -152,6 +180,8 @@ function fakeStore({ stored = null as ModeRecord | null, unanswered = false, mem
 // for, unless a test says otherwise.
 async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>, limits = {}, { store = fakeStore(), now = NOW, throwOn = null as string | null, readMs = 0, storeCallMs = 0, slept = (ms: number): number => Number(ms) || 0 } = {}) {
   const sent: GeminiRecord[] = [];
+  const accounts: AccountRecord[] = [];
+  const lines: string[] = [];
   const waits: number[] = [];
   let keepAlives = 0;
   let clock = now;
@@ -164,6 +194,7 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
           side.events.push(`read ${String((JSON.parse(json) as unknown[])[0])}`);
           clock += readMs;
         }
+        if (rpcid === 'ESY5D') side.events.push('account');
         return fake.postForm(url, body);
       },
     },
@@ -176,6 +207,13 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
     },
     store: {
       mode: store.mode,
+      account: {
+        get: () => store.account.get(),
+        set: (state) => {
+          side.events.push('account state');
+          return store.account.set(state);
+        },
+      },
       memo: {
         get: (chatId) => {
           clock += storeCallMs;
@@ -193,6 +231,12 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
     },
     now: () => clock,
     dispatch: (record) => {
+      if (record.name === 'rex-account') {
+        if (throwOn === 'rex-account') throw new Error('queue full');
+        accounts.push(record);
+        side.events.push('dispatch rex-account');
+        return;
+      }
       if (record.identifier === throwOn) throw new Error('queue full');
       sent.push(record);
       side.events.push(`dispatch ${record.identifier}`);
@@ -207,9 +251,9 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
     },
     requestId: 123456,
     limits: { ...LIMITS, ...limits },
-    log: () => {},
+    log: (line) => lines.push(line),
   });
-  return { outcome, sent, waits, keepAlives };
+  return { outcome, sent, accounts, lines, waits, keepAlives };
 }
 
 const T = 1700000000;
@@ -1128,4 +1172,204 @@ test('a memo that holds something else is read as none, and a successful read cl
   const store = fakeStore({ malformed: [chatId(1)] });
   await pass(fake, framework({ summarize: false }), {}, { store });
   assert.deepEqual([readsOf(fake), store.counts.memoClears], [[chatId(1)], 1]);
+});
+
+// The account read (account.mts): one ESY5D call after the page token and
+// before the walk, crawl_delay after the homepage and again before the first
+// list call, when the served config turns it on and the interval has passed.
+const ON: AccountSettings = { enabled: true, intervalMinutes: 60 };
+const ACCOUNT_CALL = `account ${batchUrl('ESY5D', 123456)} ${batchBody('ESY5D', [null, [5]], 'PAGE-TOKEN:1').toString()}`;
+const LIST_CALLS = ['list [1,null,1] null at=PAGE-TOKEN:1 _reqid=123456', 'list [0,null,1] null at=PAGE-TOKEN:1 _reqid=123456'];
+const accountCalls = (fake: ReturnType<typeof client>) => fake.calls.filter((call) => call.startsWith('account'));
+// The account record as sent: history_saved and the call's status, every
+// other standard key null.
+const accountRecord = (historySaved: boolean, date: number) => ({
+  name: 'rex-account', platform: 'gemini', format_version: 1, date,
+  plan: null, paid: null, workspace: null, web_search_enabled: null, training_allowed: null,
+  history_saved: historySaved, memory_enabled: null, custom_instructions_set: null, account_created: null,
+  source_status: { ESY5D: 200 }, metadata: {},
+});
+// A read after the wait before the account call: the clock moves with waits.
+const READ_AT = NOW + 30_000;
+
+test('with the account read off, a pass makes today\'s calls and waits and never touches the account state', async () => {
+  for (const account of [undefined, { enabled: false, intervalMinutes: 15 }]) {
+    const label = String(JSON.stringify(account));
+    const fake = client({ main: listPage(entries(1)) });
+    const side = framework(account === undefined ? {} : { account });
+    const store = fakeStore();
+    const run = await pass(fake, side, {}, { store });
+    assert.deepEqual(fake.calls, ['GET https://gemini.google.com/app', ...LIST_CALLS], label);
+    assert.deepEqual(side.events, ['wait 30000', `dispatch ${chatId(1)}`, 'wait 1500', `stamp ${chatId(1)}`], label);
+    assert.deepEqual([run.accounts, store.counts.accountGets, store.counts.accountSets], [[], 0, 0], label);
+  }
+});
+
+test('on, the account is read once after the page token, crawl_delay before and after, and its record sent and its state stored', async () => {
+  const fake = client({ main: listPage(entries(1)) });
+  const side = framework({ account: ON });
+  const store = fakeStore();
+  const run = await pass(fake, side, {}, { store });
+  assert.deepEqual(fake.calls, ['GET https://gemini.google.com/app', ACCOUNT_CALL, ...LIST_CALLS]);
+  // The wait before the account call, the one before the walk, then the
+  // walk's own between its two list calls.
+  assert.deepEqual(side.events, ['wait 30000', 'account', 'dispatch rex-account', 'wait 30000', 'account state', 'wait 30000', `dispatch ${chatId(1)}`, 'wait 1500', `stamp ${chatId(1)}`]);
+  assert.deepEqual(run.accounts, [accountRecord(true, READ_AT)]);
+  assert.deepEqual(store.accountWrites, [{ hash: await accountHash(run.accounts[0]), sentAt: READ_AT, readAt: READ_AT }]);
+  assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1)], reason: 'Fetch successful.', issue: null });
+});
+
+test('on, the account is read again only after the interval, and sent again only when it changed or a day after the last send', async () => {
+  const store = fakeStore();
+  const side = framework({ account: ON });
+  const at = async (now: number, account = activity(true)) => {
+    const fake = client({ main: listPage(entries(1)), account });
+    const run = await pass(fake, side, {}, { store, now });
+    return [accountCalls(fake).length, run.accounts.map((record) => record.history_saved)];
+  };
+  assert.deepEqual(await at(NOW), [1, [true]]);
+  const sent = store.accountWrites[0];
+  assert.deepEqual(await at(NOW + 10 * MINUTE), [0, []], 'read again within the interval');
+  assert.deepEqual(await at(NOW + 61 * MINUTE), [1, []], 'sent again unchanged within the day');
+  assert.deepEqual(store.accountWrites.at(-1), { ...sent, readAt: NOW + 61 * MINUTE + 30_000 });
+  // A rate limit keeps what was sent and moves the read time on.
+  assert.deepEqual(await at(NOW + 122 * MINUTE, { kind: 'ok', status: 429, text: '' }), [1, []]);
+  assert.deepEqual(store.accountWrites.at(-1), { ...sent, readAt: NOW + 122 * MINUTE + 30_000 });
+  assert.deepEqual(await at(NOW + 183 * MINUTE, activity(false)), [1, [false]], 'a change was not sent');
+  assert.deepEqual(await at(NOW + 244 * MINUTE, activity(false)), [1, []]);
+  assert.deepEqual(await at(NOW + 183 * MINUTE + DAY, activity(false)), [1, [false]], 'not sent again a day after the last send');
+});
+
+test('on, a failed call or an answer that is not the flag sends nothing, stores the read time, and leaves the pass as with the read off', async () => {
+  const off = await pass(client({ main: listPage(entries(2)) }), framework());
+  const cases: [string, Answer][] = [
+    ['429', { kind: 'ok', status: 429, text: '' }],
+    ['503', { kind: 'ok', status: 503, text: '' }],
+    ['500', { kind: 'ok', status: 500, text: '' }],
+    ['timeout', { kind: 'timeout' }],
+    ['network', { kind: 'network' }],
+    ['an HTML page with 200', { kind: 'ok', status: 200, text: '<html>Sign in</html>' }],
+    ['an expired session', { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wrb.fr","ESY5D",null,null,null,[16],"generic",[["type.googleapis.com/assistant.boq.bard.application.BardErrorInfo",[1096]]]]]\n` }],
+    ['an error frame', { kind: 'ok', status: 200, text: batchResponse(wrbError('ESY5D', 3)) }],
+    ['a reshaped flag', activity('yes')],
+    ['500 with the flag in its body', { kind: 'ok', status: 500, text: batchResponse(wrb('ESY5D', [[null, null, null, null, true]])) }],
+    ['206 with the flag in its body', { kind: 'ok', status: 206, text: batchResponse(wrb('ESY5D', [[null, null, null, null, true]])) }],
+  ];
+  for (const [what, account] of cases) {
+    const fake = client({ main: listPage(entries(2)), account });
+    const store = fakeStore();
+    const run = await pass(fake, framework({ account: ON }), {}, { store });
+    assert.deepEqual([run.outcome, run.sent], [off.outcome, off.sent], what);
+    assert.deepEqual([accountCalls(fake).length, run.accounts, store.accountWrites], [1, [], [{ hash: '', sentAt: 0, readAt: READ_AT }]], what);
+    assert.ok(run.lines.every((line) => !line.includes('PAGE-TOKEN') && !line.includes('ESY5D')), `${what}:\n${run.lines.join('\n')}`);
+  }
+});
+
+test('on, an account state that gets no answer holds the read back, and one that is malformed reads as none', async () => {
+  const silent = client({ main: listPage(entries(1)) });
+  const silentStore = fakeStore({ accountUnanswered: true });
+  const held = await pass(silent, framework({ account: ON }), {}, { store: silentStore });
+  assert.deepEqual([accountCalls(silent), held.accounts, silentStore.accountWrites, held.outcome.reason], [[], [], [], 'Fetch successful.']);
+  const malformed = fakeStore();
+  malformed.account.get = async () => ({ value: null, unanswered: false, malformed: true });
+  const read = await pass(client({ main: listPage(entries(1)) }), framework({ account: ON }), {}, { store: malformed });
+  assert.deepEqual(read.accounts, [accountRecord(true, READ_AT)]);
+});
+
+test('on, a switch-off during the wait before the account call stops it, and the pass reports the switch-off', async () => {
+  let switchedOff = false;
+  const fake = client({ main: listPage(entries(1)) });
+  const store = fakeStore();
+  const outcome = await runPass({
+    client: fake,
+    framework: framework({ account: ON, enabled: () => !switchedOff }).fw,
+    store,
+    now: () => NOW,
+    dispatch: () => {},
+    sleep: async () => {
+      switchedOff = true;
+    },
+    keepAlive: () => {},
+    requestId: 1,
+    limits: LIMITS,
+    log: () => {},
+  });
+  assert.deepEqual([outcome, fake.calls, store.accountWrites], [{ crawledCount: -1, crawledIds: [], reason: 'Crawl stopped: spider disabled.', issue: null }, ['GET https://gemini.google.com/app'], []]);
+});
+
+test('on, an error in the account read is logged by its kind, and the pass goes on as with the read off', async () => {
+  const off = await pass(client({ main: listPage(entries(2)) }), framework());
+  const throwing = framework({ account: ON });
+  throwing.fw.account = () => {
+    throw new TypeError('secret detail');
+  };
+  const rejecting = fakeStore();
+  rejecting.account.get = () => Promise.reject(new RangeError('secret detail'));
+  for (const [what, side, store, throwOn, kind] of [
+    ['the settings throw', throwing, fakeStore(), null, 'TypeError'],
+    ['the state read rejects', framework({ account: ON }), rejecting, null, 'RangeError'],
+    ['the dispatch throws', framework({ account: ON }), fakeStore(), 'rex-account', 'Error'],
+  ] as const) {
+    const run = await pass(client({ main: listPage(entries(2)) }), side, {}, { store, throwOn });
+    assert.deepEqual([run.outcome, run.sent, run.accounts], [off.outcome, off.sent, []], what);
+    assert.ok(run.lines.some((line) => line.includes(`(${kind})`)), `${what}: not logged by its kind:\n${run.lines.join('\n')}`);
+    assert.ok(run.lines.every((line) => !line.includes('secret detail')), what);
+  }
+});
+
+test('on, a record that could not be dispatched stores only the read time, so a change is sent at the next read', async () => {
+  const store = fakeStore();
+  const side = framework({ account: ON });
+  await pass(client({ main: listPage(entries(1)) }), side, {}, { store, throwOn: 'rex-account' });
+  assert.deepEqual(store.accountWrites, [{ hash: '', sentAt: 0, readAt: READ_AT }]);
+  const next = await pass(client({ main: listPage(entries(1)) }), side, {}, { store, now: NOW + 61 * MINUTE });
+  assert.deepEqual(next.accounts.map((record) => record.history_saved), [true]);
+});
+
+test('on, every store call of a pass is preceded by a keep-alive call, the account state\'s included', async () => {
+  const side = framework({ account: ON });
+  const store = fakeStore();
+  const run = await pass(client({ main: listPage(entries(1)) }), side, {}, { store });
+  const { counts } = store;
+  assert.deepEqual([counts.accountGets, counts.accountSets], [1, 1], 'Test setup invalid: the pass made other account state calls than expected');
+  assert.equal(run.keepAlives, side.counts.windows + side.counts.reads + side.counts.stampTries + counts.gets + counts.sets + counts.accountGets + counts.accountSets);
+});
+
+test('on, an error after the account call still stores the read time, so the call waits out the interval', async (t) => {
+  t.mock.method(crypto.subtle, 'digest', () => Promise.reject(new TypeError('no digest')));
+  const store = fakeStore();
+  const run = await pass(client({ main: listPage(entries(1)) }), framework({ account: ON }), {}, { store });
+  assert.deepEqual([run.accounts, store.accountWrites, run.outcome.reason], [[], [{ hash: '', sentAt: 0, readAt: READ_AT }], 'Fetch successful.']);
+  assert.ok(run.lines.some((line) => line.includes('(TypeError)')), run.lines.join('\n'));
+});
+
+test('on, the account read switched off during the wait before its call makes no call and stores nothing', async () => {
+  let settings: AccountSettings = ON;
+  const side = framework();
+  side.fw.account = () => settings;
+  const fake = client({ main: listPage(entries(1)) });
+  const store = fakeStore();
+  // The first wait of the pass is the one before the account call.
+  const run = await pass(fake, side, {}, { store, slept: (ms) => {
+    settings = { enabled: false, intervalMinutes: 60 };
+    return Number(ms) || 0;
+  } });
+  assert.deepEqual([accountCalls(fake), run.accounts, store.accountWrites, run.outcome.reason], [[], [], [], 'Fetch successful.']);
+});
+
+test('on, with a crawl_delay of 0 the account state is still written a settle wait after its record', async () => {
+  const side = framework({ account: ON, crawlDelay: 0 });
+  await pass(client({ main: listPage(entries(1)) }), side);
+  const from = side.events.indexOf('dispatch rex-account');
+  assert.deepEqual(side.events.slice(from, from + 3), ['dispatch rex-account', 'wait 1500', 'account state'], side.events.join(', '));
+});
+
+test('on, an account state the store does not keep is logged by its kind alone, and the pass goes on as with the read off', async () => {
+  const off = await pass(client({ main: listPage(entries(1)) }), framework());
+  const store = fakeStore();
+  store.account.set = async () => ({ ok: false, unanswered: false });
+  const run = await pass(client({ main: listPage(entries(1)) }), framework({ account: ON }), {}, { store });
+  assert.deepEqual([run.outcome, run.sent], [off.outcome, off.sent]);
+  assert.ok(run.lines.includes('the account state was not kept'), run.lines.join('\n'));
+  assert.ok(run.lines.every((line) => !/[0-9a-f]{64}|PAGE-TOKEN|ESY5D/.test(line)), run.lines.join('\n'));
 });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { MODE_KEY, keyKind, memoKey, uploadKeyId } from '../../src/keys.mts';
+import { ACCOUNT_KEY, MODE_KEY, keyKind, memoKey, uploadKeyId } from '../../src/keys.mts';
 
 test('summary mode keeps the bare chat id, the key earlier builds wrote; detail mode adds -detail', () => {
   assert.equal(uploadKeyId('c_0000000000000001', true), 'c_0000000000000001');
@@ -15,8 +15,9 @@ test('the upload key rex-spider builds from it differs between the modes for one
   assert.equal(key(false), 'rex-spider-gemini-conversation-upload-c_0000000000000001-detail-1700000000000');
 });
 
-test('the mode record and the memos sit under the spider\'s namespace', () => {
+test('the mode record, the account state and the memos sit under the spider\'s namespace', () => {
   assert.equal(MODE_KEY, 'rex-spider-gemini-mode');
+  assert.equal(ACCOUNT_KEY, 'rex-spider-gemini-account');
   assert.equal(memoKey('c_0000000000000001'), 'rex-spider-gemini-detail-memo-c_0000000000000001');
 });
 
@@ -27,6 +28,7 @@ test('a memo key needs a chat id', () => {
 
 test('what may be logged of a key is its kind, never a chat id', () => {
   assert.equal(keyKind(MODE_KEY), 'rex-spider-gemini-mode');
+  assert.equal(keyKind(ACCOUNT_KEY), 'rex-spider-gemini-account');
   assert.equal(keyKind(memoKey('c_0000000000000001')), 'rex-spider-gemini-detail-memo');
   assert.equal(keyKind('rex-spider-gemini-conversation-upload-c_0000000000000001-1700000000000'), 'other key');
 });

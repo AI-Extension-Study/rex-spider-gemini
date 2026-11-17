@@ -168,3 +168,17 @@ test('memo fields of the wrong form, and arrays dressed as records, read as malf
   core.values.set('rex-spider-gemini-mode', Object.assign([], { mode: 'summary', since: 1 }));
   assert.deepEqual(await store.mode.get(), { value: null, unanswered: false, malformed: true });
 });
+
+test('the account state reads back as written under its own key, and anything else stored there reads as malformed', async () => {
+  const core = rexCore();
+  const lines: string[] = [];
+  const store = createStore(core.handleMessage, { log: (line) => lines.push(line) });
+  assert.deepEqual(await store.account.get(), { value: null, unanswered: false, malformed: false });
+  const state = { hash: 'a'.repeat(64), sentAt: 1700000000000, readAt: 1700000100000 };
+  assert.deepEqual(await store.account.set(state), { ok: true, unanswered: false });
+  assert.deepEqual(core.values.get('rex-spider-gemini-account'), state);
+  assert.deepEqual(await store.account.get(), { value: state, unanswered: false, malformed: false });
+  core.values.set('rex-spider-gemini-account', { ...state, hash: 'secret' });
+  assert.deepEqual(await store.account.get(), { value: null, unanswered: false, malformed: true });
+  assert.ok(lines.every((line) => !line.includes('secret')), lines.join('\n'));
+});

@@ -23,6 +23,9 @@ export function uploadKeyId(chatId: string, summary: boolean): string {
 // The served mode and when this browser first saw it (store.mts, ModeRecord).
 export const MODE_KEY = `${KEY_PREFIX}mode`;
 
+// The account read's state (store.mts, AccountState).
+export const ACCOUNT_KEY = `${KEY_PREFIX}account`;
+
 const MEMO_PREFIX = `${KEY_PREFIX}detail-memo-`;
 
 // One chat's memo of a failed detail read (store.mts, DetailMemo).
@@ -33,8 +36,8 @@ export function memoKey(chatId: string): string {
 // The part of a key that may be logged: its kind. A memo key carries a chat
 // id, and a key this module does not own is not echoed at all.
 export function keyKind(key: string): string {
-  if (key === MODE_KEY) {
-    return MODE_KEY;
+  if (key === MODE_KEY || key === ACCOUNT_KEY) {
+    return key;
   }
   if (key.startsWith(MEMO_PREFIX)) {
     return `${KEY_PREFIX}detail-memo`;

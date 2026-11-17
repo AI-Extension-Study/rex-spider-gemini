@@ -35,6 +35,8 @@ const LIST_CALL = (args: string) => `POST /_/BardChatUi/data/batchexecute MaZiqc
 const OTHER_LIST = LIST_CALL('[10,null,[1,null,1]]')
 const MAIN_LIST = LIST_CALL('[10,null,[0,null,1]]')
 const ONE_CRAWL = ['GET /app', OTHER_LIST, MAIN_LIST]
+// The account read, made only when the served config turns it on.
+const ACCOUNT_CALL = 'POST /_/BardChatUi/data/batchexecute ESY5D [null,[5]] at=TEST-TOKEN:1'
 const READ_CALL = (n: number) => `POST /_/BardChatUi/data/batchexecute hNvQHb ${JSON.stringify([chat(n), 200, null, 1, [0], [4], null, 1])} at=TEST-TOKEN:1`
 
 // Answers the homepage, both list calls and a read of each listed chat, and
@@ -42,8 +44,10 @@ const READ_CALL = (n: number) => `POST /_/BardChatUi/data/batchexecute hNvQHb ${
 // such as a call without this page's token, gets a 404, and its line shows
 // what was wrong. The main list is read at each call, so a test can add to
 // it. beforeMain, if given, is awaited before the main list is answered; the
-// reads of the chats in failReads answer with an error frame.
-async function answerGemini(context, mainList: unknown[][], { homeStatus = 200, beforeMain = async () => {}, failReads = [] as number[] } = {}) {
+// reads of the chats in failReads answer with an error frame. activity, if
+// given, is what the account call answers for Gemini Apps Activity; without
+// it, the account call is refused as any other call is.
+async function answerGemini(context, mainList: unknown[][], { homeStatus = 200, beforeMain = async () => {}, failReads = [] as number[], activity = null as boolean | null } = {}) {
   const urls: string[] = []
   const calls: string[] = []
   await context.route('https://gemini.google.com/**', async (route) => {
@@ -69,6 +73,10 @@ async function answerGemini(context, mainList: unknown[][], { homeStatus = 200, 
       const n = Number.parseInt(String(listed[0]).slice(2), 16)
       const body = failReads.includes(n) ? batchError('hNvQHb', 5) : batch('hNvQHb', read(n, (listed[5] as number[])[0]))
       await route.fulfill({ status: 200, contentType: 'application/json', body })
+      return
+    }
+    if (activity !== null && call === ACCOUNT_CALL) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: batch('ESY5D', [[null, null, null, null, activity]]) })
       return
     }
     if (call !== OTHER_LIST && call !== MAIN_LIST) {
@@ -119,6 +127,7 @@ async function crawl(serviceWorker) {
 }
 
 const records = (events) => events.filter((event) => event.name === 'rex-conversation')
+const accounts = (events) => events.filter((event) => event.name === 'rex-account')
 
 // The upload keys a build that sent summaries only left behind, as rex-spider
 // writes them: the bare chat id, the last-message time in ms, and the time
@@ -345,4 +354,32 @@ test('a failed read goes out as a summary and its memo holds the chat back, and 
   expect(records(third.events)).toEqual([summary(3, T + 120, iso(T + 120))])
   expect(completions(third.events)).toEqual([[1, [chat(1), chat(2), chat(3), chat(4)], 'Crawl stopped: detail reads failed.']])
   expect(third.result.issues).toEqual([{ url: HOME, message: 'Crawl stopped: detail reads failed.' }])
+})
+
+test('served account enabled, a crawl reads Gemini Apps Activity before the list and sends one account record, and the next crawl does not read it again', async ({ context, serviceWorker }) => {
+  const traffic = await answerGemini(context, [entry(1, T)], { activity: true })
+  await untilStoreOpen(serviceWorker)
+  await configure(serviceWorker, { summarize: true, account: { enabled: true } })
+
+  const before = Date.now()
+  const first = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual(['GET /app', ACCOUNT_CALL, OTHER_LIST, MAIN_LIST])
+  expect(accounts(first.events)).toEqual([{
+    name: 'rex-account', platform: 'gemini', format_version: 1, date: expect.any(Number),
+    plan: null, paid: null, workspace: null, web_search_enabled: null, training_allowed: null,
+    history_saved: true, memory_enabled: null, custom_instructions_set: null, account_created: null,
+    source_status: { ESY5D: 200 }, metadata: {},
+  }])
+  expect(accounts(first.events)[0].date).toBeGreaterThanOrEqual(before)
+  expect(records(first.events)).toEqual([summary(1, T, iso(T))])
+  expect(completions(first.events)).toEqual([[1, [chat(1)], 'Fetch successful.']])
+
+  const second = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual(ONE_CRAWL)
+  expect(accounts(second.events)).toEqual([])
+
+  const allowed = await serviceWorker.evaluate(() => new Promise((resolve) => {
+    self.rexCorePlugin.handleMessage({ messageType: 'fetchAllowedURLs' }, null, resolve)
+  }))
+  expect(traffic.urls.filter((url) => !allowed.some((pattern) => new RegExp(pattern).test(url)))).toEqual([])
 })

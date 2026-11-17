@@ -11,6 +11,8 @@ The Gemini crawler for a research browser extension (this fork of bric-digital's
 | per chat | id (`c_` and hex), the last message's time, and the chat's list entry | the same, plus `started`, the first exchange's time, when the read returned the whole chat |
 | per exchange | nothing | two turns, the prompt's and the shown reply's, with counts (below) |
 
+With the served `account` setting on (off by default), it also sends an account record: whether Gemini Apps Activity is on (see "The account record").
+
 Never collected: message text (only counts), the reply's other drafts (only how many there were), thinking, tool results, file names or contents (only their types), links, and which model answered.
 
 ## How a pass works
@@ -18,10 +20,11 @@ Never collected: message text (only counts), the reply's other drafts (only how 
 The extension starts a crawl round every minute, but only while an ID is stored and only when its configuration request gets an HTTP answer. rex-spider starts a Gemini pass when none is running and `sleep_delay` has passed since the last one.
 
 1. Read `https://gemini.google.com/app` for the page token (`SNlM0e`) the site's own requests carry. A page without one ends the pass.
-2. Walk the chat list: the `MaZiqc` call to `/_/BardChatUi/data/batchexecute`, 10 chats a page, in two list calls (`[1,null,1]`, then `[0,null,1]`), each followed to its last page on every pass, `crawl_delay` between pages. A chat both calls list counts once.
-3. Keep the chats whose last message falls in the crawl window and that have no upload key in the served mode (see "Modes and the re-send"). They go out newest first.
-4. Summary mode sends the list entries as records, 25 at a time. Detail mode reads each chat with the `hNvQHb` call, which returns its newest 200 exchanges, `crawl_delay` apart and never closer than 3 s, and reads the page token again once it is 30 minutes old.
-5. Send one completion event (see "Reading the completion events").
+2. If the account read is on and due, make its one call (see "The account record").
+3. Walk the chat list: the `MaZiqc` call to `/_/BardChatUi/data/batchexecute`, 10 chats a page, in two list calls (`[1,null,1]`, then `[0,null,1]`), each followed to its last page on every pass, `crawl_delay` between pages. A chat both calls list counts once.
+4. Keep the chats whose last message falls in the crawl window and that have no upload key in the served mode (see "Modes and the re-send"). They go out newest first.
+5. Summary mode sends the list entries as records, 25 at a time. Detail mode reads each chat with the `hNvQHb` call, which returns its newest 200 exchanges, `crawl_delay` apart and never closer than 3 s, and reads the page token again once it is 30 minutes old.
+6. Send one completion event (see "Reading the completion events").
 
 Detail reads stop once a pass has spent 360 s reading (requests, parsing and storage calls; the waits do not count), counted from its first read. Chats not reached keep no key and go out in a later pass. Waits run in steps of at most 20 s with a cheap extension call before each, every request gives up after 20 s, and a list is cut after 1,000 pages or 3 pages in a row that bring no new chat.
 
@@ -49,6 +52,14 @@ Top level: `name` (`rex-conversation`), `platform` (`gemini`), `identifier` (the
 `summarize: true` is summary mode; absent or `false` is detail mode. The spider takes the setting again, in both directions, at every configuration refresh whose configuration has a `gemini` or `default` block, and checks it before each detail read: summary mode served during the reads ends them, and the next pass runs in summary mode.
 
 Each mode has its own upload key: the bare chat id in summary mode, the key earlier builds wrote, and `<chat id>-detail` in detail mode, each with the last message's time. The spider stores the served mode and when this browser's first pass in it ran (`rex-spider-gemini-mode`). A chat with a key only in the other mode is sent again, once, if its last message is no earlier than 90 days before that pass; older chats keep the record they have. A browser with no stored mode counts as switching on its first pass.
+
+## The account record
+
+Off unless the served configuration turns it on (see "Settings it reads"). When on, a pass reads Gemini Apps Activity once the interval has passed since the last read, or when the stored read time is more than 5 minutes ahead of the clock (the clock moved back). The read is one `ESY5D` call to `/_/BardChatUi/data/batchexecute` with `[null,[5]]`, after the page token and before the list, with `crawl_delay` before it and again before the first list call (never less than 3 s). It answers `[[null,null,null,null,true]]` with activity on and `false` with it off.
+
+The record is a `rex-account` point of its own, in the account record layout the AI crawlers share (format 1): `name` (`rex-account`), `platform` (`gemini`), `format_version` (`1`), `date` (the read, epoch ms), then `plan`, `paid`, `workspace`, `web_search_enabled`, `training_allowed`, `history_saved`, `memory_enabled`, `custom_instructions_set`, `account_created`, `source_status` and `metadata`. Gemini fills only `history_saved` (activity on or off; with it off Gemini keeps no chats); the other standard keys are null, `source_status` is `{"ESY5D": <HTTP status>}` and `metadata` is `{}`.
+
+A record goes out when the call answered HTTP 200 with the flag, and it differs from the last one sent, or that one went out 24 hours ago or more (or more than 5 minutes ahead of the clock). Any other status, a rate limit, a failed call, an expired session or any other answer sends nothing. Once the call is made, whatever it answered, the read time is stored under `rex-spider-gemini-account` (with the last record's hash and send time), so the next read comes an interval later. No call is made, and nothing is stored, when the stored state gets no answer, or when the spider or the account read is switched off during the wait before the call. The account read never changes a pass's reason, count or issues.
 
 ## What is removed, and how
 
@@ -87,6 +98,7 @@ rex-spider merges `spider.spiders.gemini` over `spider.spiders.default` from the
 | `halt_on_error` | `true` | `true` ends the detail reads at the first failed read, `false` at three in a row |
 | `crawl_delay` | `30000` | ms between requests; a value that does not read as a positive number means no wait between list pages and 3 s between reads |
 | `sleep_delay` | `300000` | ms between passes, applied by rex-spider |
+| `account` | absent | `{"enabled": true}` turns on the account read (see "The account record"); `interval_minutes`, a whole number from 15 to 1440, sets minutes between reads, else 60. A `gemini` block's `account` replaces the `default` one whole |
 | `start`, `end`, `time_anchor` | none, none, `runtime` | the crawl window: `start` and `end` in ms from the install time (`install`) or from now (`runtime`), or as epoch ms (`absolute`); a chat is in it by its last message |
 
 ## What it cannot see
