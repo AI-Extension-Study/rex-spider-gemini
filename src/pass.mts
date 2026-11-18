@@ -276,15 +276,21 @@ function tokenFrom(home: Answer): { readonly at: string } | { readonly failure: 
   return at === null ? { failure: 'no token' } : { at };
 }
 
+// The token for the next request, and whether it was just read again, so
+// the caller's wait came after it; or why the caller stops. The walk takes it
+// as a WalkToken.
+type TokenFor = { readonly at: string; readonly renewed: boolean } | Extract<WalkToken, { readonly stop: unknown }>;
+
 // The page token for the next list call or detail read. One older than
 // tokenAgeMs, or marked stale, is read again from the homepage first. A
 // token that cannot be read again (signed out, refused, no answer) stops the
 // caller. The homepage read is a request like any other, so the caller's
 // wait (pause) follows it before the next one, and enabled is read again
-// after that wait, as before every request.
-async function currentToken(deps: PassDeps, limits: PassLimits, log: (line: string) => void, token: PageToken, pause: () => Promise<void>): Promise<WalkToken> {
+// after that wait, as before every request. A caller that also reads the
+// served mode before each request reads it again when renewed is true.
+async function currentToken(deps: PassDeps, limits: PassLimits, log: (line: string) => void, token: PageToken, pause: () => Promise<void>): Promise<TokenFor> {
   if (!token.stale && deps.now() - token.atRead <= limits.tokenAgeMs) {
-    return { at: token.at };
+    return { at: token.at, renewed: false };
   }
   const read = tokenFrom(await deps.client.get(HOME_URL));
   if (!('at' in read)) {
@@ -296,7 +302,7 @@ async function currentToken(deps: PassDeps, limits: PassLimits, log: (line: stri
   token.atRead = deps.now();
   token.stale = false;
   await pause();
-  return deps.framework.isEnabled() ? { at: token.at } : { stop: 'disabled' };
+  return deps.framework.isEnabled() ? { at: token.at, renewed: true } : { stop: 'disabled' };
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -414,6 +420,12 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
         return { sent, disabled: true, stopped: null };
       }
       log('the chats not read are read in a later pass');
+      break;
+    }
+    // Summary mode served during the wait after a re-read ends the reads, as
+    // it does before any read.
+    if (token.renewed && framework.justSummarize()) {
+      log('summary mode was served during the detail reads; a later pass sends the chats not read');
       break;
     }
     const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), token.at));

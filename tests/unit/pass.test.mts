@@ -918,6 +918,23 @@ test('a page token read again is followed by a crawl_delay wait before the next 
   ], 'in the detail reads');
 });
 
+test('summary mode served during the wait after a re-read of the page token ends the reads before the next read, as at any read', async () => {
+  let summary = false;
+  const fake = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  const homepages = () => tokenCalls(fake).filter((call) => call === 'homepage').length;
+  const side = framework({ summarize: () => summary, crawlDelay: 11 * MINUTE });
+  // The token is read again before the second read, at 33 minutes; summary
+  // mode is served during the wait that follows that homepage read.
+  const run = await pass(fake, side, {}, { slept: (ms) => {
+    if (homepages() === 2) summary = true;
+    return Number(ms) || 0;
+  } });
+  assert.deepEqual(tokenCalls(fake), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage'], 'a detail read went out after summary mode was served');
+  assert.ok(run.lines.includes('summary mode was served during the detail reads; a later pass sends the chats not read'), run.lines.join('\n'));
+  assert.deepEqual(keysOf(side), [`${chatId(3)}-detail`]);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [1, 'Fetch successful.']);
+});
+
 // The list stops after which the detail reads first read the page token
 // again: each may mean the site would answer the reads the same way, a
 // sign-in page answered with HTTP 200 included.
