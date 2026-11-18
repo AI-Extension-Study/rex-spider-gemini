@@ -1,10 +1,11 @@
 // The rex-conversation records the spider sends, in the standard record
-// layout the AI crawlers share (format 1): each turn is the REX Turn with its
+// layout the AI crawlers share: each turn is the REX Turn with its
 // content-free keys kept and its text-bearing keys replaced by counts made in
 // the browser. Pure.
 //
 // A summary record is the record this spider has always sent, built from the
-// list entry alone, with is_summary true and the format version. A detail
+// list entry alone, with is_summary true and the data format the pass runs
+// under as format_version (format.mts; 1 unless served another). A detail
 // record has every field of the summary record, so code that reads one reads
 // the other, and adds the chat's start, whether its turns are complete, and
 // two turns per exchange, the prompt's and then the reply's. The metadata of
@@ -14,8 +15,6 @@ import { DateString } from '@bric/rex-types/types';
 
 import { type ListItem, toConversation } from './list.mts';
 import { type Exchange, type ReadResult } from './read.mts';
-
-export const FORMAT_VERSION = 1;
 
 // A turn's standard keys, in their order. A count is null when what it is
 // made from had another form.
@@ -52,7 +51,7 @@ export type GeminiTurn = GeminiUserTurn | GeminiAssistantTurn;
 export interface GeminiRecord {
   readonly name: 'rex-conversation';
   readonly is_summary: boolean;
-  readonly format_version: typeof FORMAT_VERSION;
+  readonly format_version: number;
   // Epoch ms: the last message for a summary record, the start for a detail
   // record whose start is known, as the other REX spiders' records do.
   readonly date: number;
@@ -66,13 +65,13 @@ export interface GeminiRecord {
   readonly metadata: readonly unknown[];
 }
 
-export function buildSummaryRecord(item: ListItem): GeminiRecord {
+export function buildSummaryRecord(item: ListItem, format: number): GeminiRecord {
   const conversation = toConversation(item);
   const ended = conversation.ended as DateString;
   return {
     name: 'rex-conversation',
     is_summary: true,
-    format_version: FORMAT_VERSION,
+    format_version: format,
     date: ended.timestamp(),
     identifier: conversation.identifier,
     turns: [],
@@ -133,8 +132,8 @@ function turnsOf(exchange: Exchange): [GeminiUserTurn, GeminiAssistantTurn] {
 // ended. The read sends exchanges newest first: reversed before the stable
 // sort, two exchanges with one time keep their order, a reply after the
 // prompt it answers.
-export function buildDetailRecord(item: ListItem, read: Extract<ReadResult, { kind: 'read' }>): GeminiRecord {
-  const summary = buildSummaryRecord(item);
+export function buildDetailRecord(item: ListItem, read: Extract<ReadResult, { kind: 'read' }>, format: number): GeminiRecord {
+  const summary = buildSummaryRecord(item, format);
   const oldestFirst = [...read.exchanges].reverse().sort((a, b) => a.whenSec - b.whenSec || a.whenNanos - b.whenNanos);
   // A start after the listed end means the chat's oldest exchange changed
   // between the list call and the read (its first prompt edited, say): the

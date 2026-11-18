@@ -8,6 +8,7 @@ import type { DateString } from '@bric/rex-types/types';
 
 import { ACCOUNT_ARGS, ACCOUNT_RPC, type AccountRecord, type AccountSettings, type AccountState, accountDue, accountHash, buildGeminiAccount, parseActivity, shouldSend } from './account.mts';
 import { type Answer, type Client } from './client.mts';
+import { dataFormatOf } from './format.mts';
 import { uploadKeyId } from './keys.mts';
 import { type ListItem } from './list.mts';
 import { CLOCK_SKEW_MS, resendSince, sentAlready } from './mode.mts';
@@ -30,8 +31,13 @@ export const HOME_URL = 'https://gemini.google.com/app';
 // served halt_on_error, false for true, read at each failed detail read.
 // account is the served account block (account.mts), read after the
 // homepage, and again with isEnabled after the wait before the account call.
+// dataFormat is the served data format (format.mts), read once when the pass
+// starts: every key the pass looks up or stamps, and every record it sends,
+// the account record included, is of that format, and a change applies from
+// the next pass.
 export interface PassFramework {
   account(): AccountSettings;
+  dataFormat(): number;
   isEnabled(): boolean;
   justSummarize(): boolean;
   continueAfterError(): boolean;
@@ -175,6 +181,8 @@ interface Sending {
   readonly limits: PassLimits;
   readonly log: (line: string) => void;
   readonly token: PageToken;
+  // The pass's data format.
+  readonly format: number;
 }
 
 interface Sent {
@@ -197,16 +205,16 @@ function dispatched(ctx: Sending, record: GeminiRecord): boolean {
   }
 }
 
-// Stamps a sent record's key, in the record's own mode, and reads it back:
-// rex-spider's logTransmitted resolves whatever the store answers, a failed
-// write included. A stamp that fails, is not kept, or gets no answer stops
-// the stamping and the sending for the pass: the store is failing, and a
-// silent one would hold each further stamp for its whole deadline. A record
+// Stamps a sent record's key, in the record's own mode and format, and reads
+// it back: rex-spider's logTransmitted resolves whatever the store answers, a
+// failed write included. A stamp that fails, is not kept, or gets no answer
+// stops the stamping and the sending for the pass: the store is failing, and
+// a silent one would hold each further stamp for its whole deadline. A record
 // sent but not stamped, the rest of a summary batch included, goes out again
 // in a later pass, so none is lost. The records already sent stay counted.
 async function stamped(ctx: Sending, record: GeminiRecord): Promise<boolean> {
   const { framework, keepAlive } = ctx.deps;
-  const id = uploadKeyId(record.identifier, record.is_summary);
+  const id = uploadKeyId(record.identifier, record.is_summary, record.format_version);
   try {
     await step(() => framework.logTransmitted(id, record.ended), ctx.limits.storeMs, keepAlive, ctx.log);
     if (!(await step(() => framework.checkIfAlreadyTransmitted(id, record.ended), ctx.limits.storeMs, keepAlive, ctx.log))) {
@@ -436,7 +444,7 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
         touch(deps.keepAlive, log);
         await store.memo.clear(item.id);
       }
-      const record = buildDetailRecord(item, read);
+      const record = buildDetailRecord(item, read, ctx.format);
       if (dispatched(ctx, record)) {
         sent += 1;
         pending = { kind: 'stamp', record };
@@ -452,10 +460,12 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
     const failures = (earlier?.failures ?? 0) + 1;
     let memoDue = true;
     if (failures === 1) {
-      const summary = buildSummaryRecord(item);
+      const summary = buildSummaryRecord(item, ctx.format);
       let sentBefore: boolean;
       try {
-        sentBefore = await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true), summary.ended), limits.storeMs, deps.keepAlive, log);
+        // The summary key of the pass's format: one of another format says
+        // nothing about this one.
+        sentBefore = await step(() => framework.checkIfAlreadyTransmitted(uploadKeyId(item.id, true, ctx.format), summary.ended), limits.storeMs, deps.keepAlive, log);
       } catch (error) {
         log(`a key read ${error instanceof StoreSilent ? 'got no answer' : `failed (${kindOf(error)})`}; sending stops for this pass`);
         return { sent, disabled: false, stopped: null };
@@ -516,7 +526,7 @@ function accountFailure(answer: Answer): string {
 // After the call, the read time is stored, even when building or sending the
 // record failed, so the call waits out the interval; the record's hash and
 // send time are stored only when it was sent.
-async function readAccount(deps: PassDeps, at: string, limits: PassLimits, log: (line: string) => void): Promise<void> {
+async function readAccount(deps: PassDeps, at: string, limits: PassLimits, log: (line: string) => void, format: number): Promise<void> {
   const { client, framework, store } = deps;
   try {
     const settings = framework.account();
@@ -546,7 +556,7 @@ async function readAccount(deps: PassDeps, at: string, limits: PassLimits, log: 
       if (answer.kind !== 'ok' || historySaved === null) {
         log(`the account read failed (${accountFailure(answer)}); nothing is sent`);
       } else {
-        const record = buildGeminiAccount(answer.status, historySaved, readAt);
+        const record = buildGeminiAccount(answer.status, historySaved, readAt, format);
         const hash = await accountHash(record);
         if (shouldSend(stored.value, hash, readAt)) {
           deps.dispatch(record);
@@ -577,6 +587,8 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     // The mode this pass sends in. Summary served during the detail reads
     // ends them (sendDetails); any other change applies from the next pass.
     const served: Mode = framework.justSummarize() ? 'summary' : 'detail';
+    // The data format this pass looks up keys of and sends records of.
+    const format = dataFormatOf(framework.dataFormat());
     // When this browser started running the served mode, recorded now if it
     // had not run it before (mode.mts). Each store call follows a keep-alive
     // call, as every store call of a pass does.
@@ -612,7 +624,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
       return failed(NO_TOKEN);
     }
 
-    await readAccount(deps, at, limits, log);
+    await readAccount(deps, at, limits, log, format);
 
     const token: PageToken = { at, atRead, stale: false };
     const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at: () => currentToken(deps, limits, log, token, () => deps.sleep(paceMs(framework))), requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
@@ -622,12 +634,12 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
     const transmitted = (id: string, ended: DateString) => step(() => framework.checkIfAlreadyTransmitted(id, ended), limits.storeMs, deps.keepAlive, log);
     if (walk.stop?.kind !== 'disabled') {
       for (const item of walk.items) {
-        const { ended } = buildSummaryRecord(item);
+        const { ended } = buildSummaryRecord(item, format);
         if (!(await step(() => framework.crawlWindowContains(ended.timestamp()), limits.storeMs, deps.keepAlive, log))) {
           continue;
         }
         crawledIds.push(item.id);
-        if (!(await sentAlready(item.id, ended, served, since, transmitted))) {
+        if (!(await sentAlready(item.id, ended, served, since, transmitted, format))) {
           unsent.push(item);
         }
       }
@@ -659,9 +671,9 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
 
     // Newest first, so a pass cut short has sent the most recent chats.
     unsent.sort((a, b) => b.endedSec - a.endedSec);
-    const ctx: Sending = { deps, limits, log, token };
+    const ctx: Sending = { deps, limits, log, token, format };
     const { sent, disabled, stopped } = served === 'summary'
-      ? await sendSummaries(ctx, unsent.map((item) => buildSummaryRecord(item)))
+      ? await sendSummaries(ctx, unsent.map((item) => buildSummaryRecord(item, format)))
       : await sendDetails(ctx, unsent);
     // The reason says how the list was read; how much went out is the count.
     // A pass that read the whole list says "Fetch successful." even when its

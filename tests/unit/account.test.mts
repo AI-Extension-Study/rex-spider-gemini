@@ -87,7 +87,7 @@ test('parseActivity is null for an error frame, a body without the guard, a resh
 });
 
 test('the Gemini record fills history_saved and source_status, and every other standard key is null, in the standard order', () => {
-  const record = buildGeminiAccount(200, true, NOW);
+  const record = buildGeminiAccount(200, true, NOW, 1);
   assert.deepEqual(record, {
     name: 'rex-account', platform: 'gemini', format_version: 1, date: NOW,
     plan: null, paid: null, workspace: null, web_search_enabled: null, training_allowed: null,
@@ -98,17 +98,17 @@ test('the Gemini record fills history_saved and source_status, and every other s
     'name', 'platform', 'format_version', 'date',
     'plan', 'paid', 'workspace', 'web_search_enabled', 'training_allowed', 'history_saved', 'memory_enabled', 'custom_instructions_set', 'account_created', 'source_status', 'metadata',
   ]);
-  assert.equal(buildGeminiAccount(-1, null, NOW).history_saved, null);
-  assert.deepEqual(buildGeminiAccount(-1, null, NOW).source_status, { ESY5D: -1 });
-  assert.equal(buildGeminiAccount(200, 'true' as unknown as boolean, NOW).history_saved, null);
+  assert.equal(buildGeminiAccount(-1, null, NOW, 1).history_saved, null);
+  assert.deepEqual(buildGeminiAccount(-1, null, NOW, 1).source_status, { ESY5D: -1 });
+  assert.equal(buildGeminiAccount(200, 'true' as unknown as boolean, NOW, 1).history_saved, null);
 });
 
 test('the hash is SHA-256 hex of the record without its date, with keys sorted at every level', async () => {
-  const record = buildGeminiAccount(200, true, NOW);
+  const record = buildGeminiAccount(200, true, NOW, 1);
   const hash = await accountHash(record);
   assert.match(hash, /^[0-9a-f]{64}$/);
-  assert.equal(await accountHash(buildGeminiAccount(200, true, NOW + HOUR)), hash, 'the date changed the hash');
-  assert.notEqual(await accountHash(buildGeminiAccount(200, false, NOW)), hash, 'a change of setting kept the hash');
+  assert.equal(await accountHash(buildGeminiAccount(200, true, NOW + HOUR, 1)), hash, 'the date changed the hash');
+  assert.notEqual(await accountHash(buildGeminiAccount(200, false, NOW, 1)), hash, 'a change of setting kept the hash');
   const reordered = Object.fromEntries(Object.entries(record).reverse()) as typeof record;
   assert.equal(await accountHash(reordered), hash, 'the key order changed the hash');
   const nested = { ...record, source_status: { b: 1, a: 2 } };
@@ -116,4 +116,24 @@ test('the hash is SHA-256 hex of the record without its date, with keys sorted a
   const { createHash } = await import('node:crypto');
   const expected = createHash('sha256').update('{"account_created":null,"custom_instructions_set":null,"format_version":1,"history_saved":true,"memory_enabled":null,"metadata":{},"name":"rex-account","paid":null,"plan":null,"platform":"gemini","source_status":{"ESY5D":200},"training_allowed":null,"web_search_enabled":null,"workspace":null}').digest('hex');
   assert.equal(hash, expected);
+});
+
+test('the account record carries the data format it is built with, and nothing else changes', () => {
+  for (const format of [2, 3]) {
+    const record = buildGeminiAccount(200, true, NOW, format);
+    assert.equal(record.format_version, format);
+    assert.deepEqual(record, { ...buildGeminiAccount(200, true, NOW, 1), format_version: format });
+  }
+});
+
+test('the hash differs between formats for the same settings, so the first read under a new format sends its record', async () => {
+  const one = await accountHash(buildGeminiAccount(200, true, NOW, 1));
+  const two = await accountHash(buildGeminiAccount(200, true, NOW, 2));
+  assert.notEqual(two, one);
+  // The state a format-1 record sent an hour ago leaves: unchanged, it would not be sent again for a day.
+  const state = { hash: one, sentAt: NOW - HOUR, readAt: NOW - HOUR };
+  assert.deepEqual([shouldSend(state, one, NOW), shouldSend(state, two, NOW)], [false, true]);
+  const { createHash } = await import('node:crypto');
+  const expected = createHash('sha256').update('{"account_created":null,"custom_instructions_set":null,"format_version":2,"history_saved":true,"memory_enabled":null,"metadata":{},"name":"rex-account","paid":null,"plan":null,"platform":"gemini","source_status":{"ESY5D":200},"training_allowed":null,"web_search_enabled":null,"workspace":null}').digest('hex');
+  assert.equal(two, expected);
 });

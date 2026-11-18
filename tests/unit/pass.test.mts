@@ -71,15 +71,20 @@ function client({ home = HOMEPAGE as Answer | Answer[], other = EMPTY, main = EM
 // key stamped in this pass gets no answer; silentReadsAfter: every key read
 // after that many; rejectedReadsAfter: every key read after that many
 // rejects. haltOnError false is what the served configs say. account: the
-// served account read, off unless a test turns it on.
-function framework({ account = { enabled: false, intervalMinutes: 60 } as AccountSettings, windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false as boolean | (() => boolean), enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
+// served account read, off unless a test turns it on. format: the served
+// data format, 1 unless a test serves another.
+function framework({ account = { enabled: false, intervalMinutes: 60 } as AccountSettings, format = 1 as number | (() => number), windowStart = 0, held = [] as [string, number][], silentReads = false, silentStamps = false, unkeptStamps = false, silentReadBacks = false, silentReadsAfter = Infinity, rejectedReadsAfter = Infinity, haltOnError = false as boolean | (() => boolean), enabled = (): boolean => true, summarize = true as boolean | (() => boolean), crawlDelay = 30_000 as unknown } = {}) {
   const keys = new Set(held.map(([id, ms]) => `${id} ${ms}`));
   const stampedNow = new Set<string>();
   const stamped: string[] = [];
   const events: string[] = [];
-  const counts = { windows: 0, reads: 0, stampTries: 0 };
+  const counts = { windows: 0, reads: 0, stampTries: 0, formats: 0 };
   const fw: PassFramework = {
     account: () => account,
+    dataFormat: () => {
+      counts.formats += 1;
+      return typeof format === 'function' ? format() : format;
+    },
     isEnabled: enabled,
     justSummarize: () => (typeof summarize === 'function' ? summarize() : summarize),
     continueAfterError: () => !(typeof haltOnError === 'function' ? haltOnError() : haltOnError),
@@ -1360,8 +1365,8 @@ const LIST_CALLS = ['list [1,null,1] null at=PAGE-TOKEN:1 _reqid=123456', 'list 
 const accountCalls = (fake: ReturnType<typeof client>) => fake.calls.filter((call) => call.startsWith('account'));
 // The account record as sent: history_saved and the call's status, every
 // other standard key null.
-const accountRecord = (historySaved: boolean, date: number) => ({
-  name: 'rex-account', platform: 'gemini', format_version: 1, date,
+const accountRecord = (historySaved: boolean, date: number, format = 1) => ({
+  name: 'rex-account', platform: 'gemini', format_version: format, date,
   plan: null, paid: null, workspace: null, web_search_enabled: null, training_allowed: null,
   history_saved: historySaved, memory_enabled: null, custom_instructions_set: null, account_created: null,
   source_status: { ESY5D: 200 }, metadata: {},
@@ -1549,4 +1554,103 @@ test('on, an account state the store does not keep is logged by its kind alone, 
   assert.deepEqual([run.outcome, run.sent], [off.outcome, off.sent]);
   assert.ok(run.lines.includes('the account state was not kept'), run.lines.join('\n'));
   assert.ok(run.lines.every((line) => !/[0-9a-f]{64}|PAGE-TOKEN|ESY5D/.test(line)), run.lines.join('\n'));
+});
+
+// A change of data format: every chat in the crawl window goes out once more,
+// under the new format's keys and stamped with the new format.
+const sentAs = (run: Awaited<ReturnType<typeof pass>>) => run.sent.map((record) => [record.identifier, record.is_summary, record.format_version]);
+
+test('summary mode: a format-2 pass after a format-1 pass sends every chat in the window once more, as format 2 under -f2 keys, and a second sends nothing', async () => {
+  let format = 1;
+  // c_1 is outside the window.
+  const side = framework({ format: () => format, windowStart: (T + 1) * 1000 });
+  const store = fakeStore();
+  const listed = () => client({ main: listPage(entries(4)) });
+  const first = await pass(listed(), side, {}, { store });
+  assert.deepEqual(sentAs(first), [[chatId(4), true, 1], [chatId(3), true, 1], [chatId(2), true, 1]]);
+  assert.deepEqual(keysOf(side), [chatId(4), chatId(3), chatId(2)]);
+  format = 2;
+  const second = await pass(listed(), side, {}, { store });
+  assert.deepEqual(sentAs(second), [[chatId(4), true, 2], [chatId(3), true, 2], [chatId(2), true, 2]]);
+  assert.deepEqual(keysOf(side).slice(3), [`${chatId(4)}-f2`, `${chatId(3)}-f2`, `${chatId(2)}-f2`]);
+  assert.deepEqual(side.stamped.slice(3), [`${chatId(4)}-f2 ${(T + 3) * 1000}`, `${chatId(3)}-f2 ${(T + 2) * 1000}`, `${chatId(2)}-f2 ${(T + 1) * 1000}`]);
+  const third = await pass(listed(), side, {}, { store });
+  assert.deepEqual([third.sent, keysOf(side).length], [[], 6]);
+  assert.deepEqual(third.outcome, { crawledCount: 0, crawledIds: [chatId(2), chatId(3), chatId(4)], reason: 'Fetch successful.', issue: null });
+});
+
+// The browsers already in detail mode under format 1, whose served mode does
+// not change: the mode record keeps its start, and under format 1 they would
+// send nothing again.
+test('detail mode, served detail before and after: format 2 reads and sends every chat in the window, however old, and a second format-2 pass sends nothing', async () => {
+  const [old, mid, recent] = [ago(400 * DAY), ago(100 * DAY), ago(DAY)];
+  const listed = () => client({ main: listPage([listEntry(1, old), listEntry(2, mid), listEntry(3, recent)]) });
+  const formatOne: [string, number][] = [[1, old], [2, mid], [3, recent]].flatMap(([n, at]): [string, number][] => [[chatId(n), at * 1000], [`${chatId(n)}-detail`, at * 1000]]);
+  const stored = { mode: 'detail' as const, since: NOW - 300 * DAY };
+  const before = await pass(listed(), framework({ summarize: false, format: 1, held: formatOne }), {}, { store: fakeStore({ stored }) });
+  assert.deepEqual(before.sent, [], 'Test setup invalid: format 1 already sends something');
+  const side = framework({ summarize: false, format: 2, held: formatOne });
+  const store = fakeStore({ stored });
+  const first = await pass(listed(), side, {}, { store });
+  assert.deepEqual(sentAs(first), [[chatId(3), false, 2], [chatId(2), false, 2], [chatId(1), false, 2]]);
+  assert.deepEqual(keysOf(side), [`${chatId(3)}-detail-f2`, `${chatId(2)}-detail-f2`, `${chatId(1)}-detail-f2`]);
+  assert.deepEqual(store.writes, [], 'the mode record was written again');
+  const second = await pass(listed(), side, {}, { store });
+  assert.deepEqual([second.sent, second.outcome.crawledCount], [[], 0]);
+});
+
+test('summary under format 1, then detail under format 2: every chat in the window is read, not only the last 90 days', async () => {
+  const [old, recent] = [ago(400 * DAY), ago(DAY)];
+  const listed = () => client({ main: listPage([listEntry(1, old), listEntry(2, recent)]) });
+  const side = framework({ summarize: false, format: 2, held: [[chatId(1), old * 1000], [chatId(2), recent * 1000]] });
+  const store = fakeStore({ stored: { mode: 'summary', since: NOW - 500 * DAY } });
+  const run = await pass(listed(), side, {}, { store });
+  assert.deepEqual(sentAs(run), [[chatId(2), false, 2], [chatId(1), false, 2]]);
+  assert.deepEqual(store.writes, [{ mode: 'detail', since: NOW }]);
+});
+
+test('the format is read once, when the pass starts: a change during the pass applies from the next one', async () => {
+  let reads = 0;
+  // 2 at the start of each pass, 1 at any later read within it.
+  const side = framework({ summarize: false, format: () => (reads++ === 0 ? 2 : 1) });
+  const run = await pass(client({ main: listPage(entries(2)) }), side);
+  assert.deepEqual(sentAs(run), [[chatId(2), false, 2], [chatId(1), false, 2]]);
+  assert.deepEqual(keysOf(side), [`${chatId(2)}-detail-f2`, `${chatId(1)}-detail-f2`]);
+  assert.equal(side.counts.formats, 1);
+});
+
+test('format 2: a failed read sends its summary, as format 2, when only format-1 keys are held, and only once', async () => {
+  // c_1 went out at this last message under format 1, as a summary and in detail.
+  const formatOne: [string, number][] = [[chatId(1), T * 1000], [`${chatId(1)}-detail`, T * 1000]];
+  const side = framework({ summarize: false, format: 2, held: formatOne });
+  const store = fakeStore();
+  const listed = () => client({ main: listPage(entries(1)), reads: { [chatId(1)]: ERROR_READ } });
+  const first = await pass(listed(), side, {}, { store });
+  assert.deepEqual(sentAs(first), [[chatId(1), true, 2]]);
+  // The fallback's key is not stamped (sendDetails), so the memo is what holds it.
+  assert.deepEqual([keysOf(side), memoOf(store, 1)?.failures], [[], 1]);
+  const second = await pass(listed(), side, {}, { store, now: NOW + 8 * DAY });
+  assert.deepEqual([second.sent, memoOf(store, 1)?.failures], [[], 2]);
+});
+
+test('format 2: a failed read sends no summary when the format-2 summary key is held at this last message', async () => {
+  const store = fakeStore();
+  const run = await pass(client({ main: listPage(entries(1)), reads: { [chatId(1)]: ERROR_READ } }), framework({ summarize: false, format: 2, held: [[`${chatId(1)}-f2`, T * 1000]] }), {}, { store });
+  assert.deepEqual([run.sent, memoOf(store, 1)?.failures], [[], 1]);
+});
+
+test('format 2: the account record carries format 2, and its first read under format 2 sends it though format 1\'s record went out an hour ago', async () => {
+  const formatOne = await accountHash(accountRecord(true, NOW - 120 * MINUTE) as AccountRecord);
+  const state: AccountState = { hash: formatOne, sentAt: NOW - 60 * MINUTE, readAt: NOW - 60 * MINUTE };
+  const under = async (format: number) => {
+    const store = fakeStore({ accountState: state });
+    const run = await pass(client({ main: listPage(entries(1)) }), framework({ account: ON, format }), {}, { store });
+    return { run, store };
+  };
+  const one = await under(1);
+  assert.deepEqual(one.run.accounts, [], 'Test setup invalid: format 1 sends its unchanged record again');
+  const two = await under(2);
+  assert.deepEqual(two.run.accounts, [accountRecord(true, READ_AT, 2)]);
+  assert.deepEqual(two.store.accountWrites, [{ hash: await accountHash(two.run.accounts[0]), sentAt: READ_AT, readAt: READ_AT }]);
+  assert.notEqual(two.store.accountWrites[0].hash, formatOne);
 });

@@ -36,7 +36,7 @@ function detail(n: number, cursor: string | null = null): GeminiRecord {
     exchange({ chat: chatId(n), response: 1, seconds: T - 120 }),
   ], cursor), chatId(n));
   assert.equal(read.kind, 'read', 'Test setup invalid: the read did not parse');
-  return buildDetailRecord(item(n), read as Extract<typeof read, { kind: 'read' }>);
+  return buildDetailRecord(item(n), read as Extract<typeof read, { kind: 'read' }>, 1);
 }
 
 // A standard turn's keys, in order; a user turn adds attachment_types and an
@@ -51,8 +51,8 @@ async function hashed(record: GeminiRecord) {
 }
 
 test('a summary record comes back as it went in, with the title replaced by its hash', async () => {
-  const record = buildSummaryRecord(item(1));
-  const out = await redactGemini(record, hash);
+  const record = buildSummaryRecord(item(1), 1);
+  const out = await redactGemini(record, hash, 1);
   assert.deepEqual(plain(out), await hashed(record));
   assert.ok(out.ended instanceof DateString, 'ended is not written as a DateString');
 });
@@ -60,7 +60,7 @@ test('a summary record comes back as it went in, with the title replaced by its 
 test('a detail record comes back as it went in, with the title replaced by its hash', async () => {
   const record = detail(1);
   assert.ok(record.started !== undefined && record.turns.length === 4, 'Test setup invalid: no start, or not two turns for each of two exchanges');
-  const out = await redactGemini(record, hash);
+  const out = await redactGemini(record, hash, 1);
   assert.deepEqual(plain(out), await hashed(record));
   assert.ok(out.started instanceof DateString, 'started is not written as a DateString');
 });
@@ -68,7 +68,7 @@ test('a detail record comes back as it went in, with the title replaced by its h
 test('a detail record from a read that was cut, with no start, comes back as it went in', async () => {
   const record = detail(2, 'more');
   assert.equal('started' in record, false, 'Test setup invalid: a cut read gave a start');
-  assert.deepEqual(plain(await redactGemini(record, hash)), await hashed(record));
+  assert.deepEqual(plain(await redactGemini(record, hash, 1)), await hashed(record));
 });
 
 test('no text gets through: an extra key, or text in a turn field or a list position, is dropped', async () => {
@@ -93,7 +93,7 @@ test('no text gets through: an extra key, or text in a turn field or a list posi
     })), MARKER, [MARKER]],
     metadata,
   };
-  const out = await redactGemini(loaded, hash);
+  const out = await redactGemini(loaded, hash, 1);
   assert.equal(JSON.stringify(out).includes(MARKER), false, JSON.stringify(out));
   assert.equal(out.is_summary, false, 'a record with extra text was not kept as a record');
   const turns = out.turns as Record<string, unknown>[];
@@ -106,7 +106,7 @@ test('no text gets through: an extra key, or text in a turn field or a list posi
 });
 
 test('a point that is not a record this module builds keeps only the scaffold', async () => {
-  const summary = buildSummaryRecord(item(1));
+  const summary = buildSummaryRecord(item(1), 1);
   const scaffold = { name: 'rex-conversation', platform: 'gemini', identifier: chatId(1), date: T * 1000 };
   const cases: [string, Record<string, unknown>, Record<string, unknown>][] = [
     ['another name', { ...summary, name: 'rex-other' }, { ...scaffold, name: 'rex-other' }],
@@ -144,51 +144,100 @@ test('a point that is not a record this module builds keeps only the scaffold', 
   // Every case is checked before the test fails, so one break shows each case it lets through.
   const wrong: string[] = [];
   for (const [what, event, expected] of cases) {
-    if (!isDeepStrictEqual(plain(await redactGemini(event, hash)), expected)) wrong.push(what);
+    if (!isDeepStrictEqual(plain(await redactGemini(event, hash, 1)), expected)) wrong.push(what);
   }
   assert.deepEqual(wrong, [], `kept more than the scaffold: ${wrong.join('; ')}`);
 });
 
+// The accepted format is the redactor's third argument: the extension that
+// carries a copy of this file passes the format it sets in every crawler.
+// Records of format 2 are made here by hand, so this checks the redactor and
+// not the builders.
+const asFormat = (record: GeminiRecord, format: unknown) => ({ ...record, format_version: format });
+
+test('a record of the accepted format comes back as it went in, summary or detail, with that format', async () => {
+  for (const format of [2, 3, 999]) {
+    for (const record of [buildSummaryRecord(item(1), 1), detail(1)]) {
+      const event = asFormat(record, format);
+      const out = await redactGemini(event, hash, format);
+      const expected = await hashed(record);
+      expected.format_version = format;
+      assert.deepEqual(plain(out), expected, `format ${format}, ${record.is_summary ? 'summary' : 'detail'}`);
+    }
+  }
+});
+
+test('a record of another format than the accepted one keeps only the scaffold, both ways', async () => {
+  const summary = buildSummaryRecord(item(1), 1);
+  const scaffold = { name: 'rex-conversation', platform: 'gemini', identifier: chatId(1), date: T * 1000 };
+  const cases: [string, unknown, number][] = [
+    ['format 1 where 2 is accepted', summary, 2],
+    ['format 2 where 1 is accepted', asFormat(summary, 2), 1],
+    ['format 3 where 2 is accepted', asFormat(summary, 3), 2],
+    ['format 2 as text where 2 is accepted', asFormat(summary, '2'), 2],
+    ['no format where 2 is accepted', asFormat(summary, undefined), 2],
+    ['format 2.5 where 2 is accepted', asFormat(summary, 2.5), 2],
+  ];
+  const record = detail(1);
+  cases.push(['a detail record of format 1 where 2 is accepted', record, 2], ['a detail record of format 2 where 1 is accepted', asFormat(record, 2), 1]);
+  const wrong: string[] = [];
+  for (const [what, event, accepted] of cases) {
+    const expected = (event as GeminiRecord).is_summary ? scaffold : { ...scaffold, date: (T - 120) * 1000 };
+    if (!isDeepStrictEqual(plain(await redactGemini(event, hash, accepted)), expected)) wrong.push(what);
+  }
+  assert.deepEqual(wrong, [], `kept more than the scaffold: ${wrong.join('; ')}`);
+});
+
+test('an accepted format that is not a number accepts nothing, a record with no format included', async () => {
+  const summary = buildSummaryRecord(item(1), 1);
+  const scaffold = { name: 'rex-conversation', platform: 'gemini', identifier: chatId(1), date: T * 1000 };
+  for (const accepted of [undefined, null, '1', NaN]) {
+    for (const event of [summary, asFormat(summary, accepted), asFormat(summary, undefined)]) {
+      assert.deepEqual(plain(await redactGemini(event, hash, accepted as unknown as number)), scaffold, `${String(accepted)}: ${JSON.stringify((event as GeminiRecord).format_version)}`);
+    }
+  }
+});
+
 test('the scaffold keeps each field only in its form', async () => {
   const event = { name: 'Rex Conversation', platform: 'gemini', identifier: MARKER, date: 'today', generatorId: 'gen-1', _pdk_trace_context: { id: 1 }, 'passive-data-metadata': { source: 2 }, title: MARKER };
-  assert.deepEqual(await redactGemini(event, hash), { platform: 'gemini', generatorId: 'gen-1', _pdk_trace_context: { id: 1 }, 'passive-data-metadata': { source: 2 } });
+  assert.deepEqual(await redactGemini(event, hash, 1), { platform: 'gemini', generatorId: 'gen-1', _pdk_trace_context: { id: 1 }, 'passive-data-metadata': { source: 2 } });
   const text = { name: 'rex-conversation', platform: MARKER, generatorId: MARKER, date: 1 };
-  assert.deepEqual(await redactGemini(text, hash), { name: 'rex-conversation', date: 1 }, 'a platform or generator id with text');
-  const record = { ...buildSummaryRecord(item(1)), generatorId: MARKER };
-  assert.equal(JSON.stringify(await redactGemini(record, hash)).includes(MARKER), false, 'a record with text in its generator id');
+  assert.deepEqual(await redactGemini(text, hash, 1), { name: 'rex-conversation', date: 1 }, 'a platform or generator id with text');
+  const record = { ...buildSummaryRecord(item(1), 1), generatorId: MARKER };
+  assert.equal(JSON.stringify(await redactGemini(record, hash, 1)).includes(MARKER), false, 'a record with text in its generator id');
 });
 
 test('a record keeps the PDK fields it came with', async () => {
-  const record = { ...buildSummaryRecord(item(1)), generatorId: 'gemini-spider', _pdk_trace_context: { id: 1 }, 'passive-data-metadata': { source: 2 } };
-  const out = await redactGemini(record, hash);
+  const record = { ...buildSummaryRecord(item(1), 1), generatorId: 'gemini-spider', _pdk_trace_context: { id: 1 }, 'passive-data-metadata': { source: 2 } };
+  const out = await redactGemini(record, hash, 1);
   assert.deepEqual([out.generatorId, out._pdk_trace_context, out['passive-data-metadata'], out.is_summary], ['gemini-spider', { id: 1 }, { source: 2 }, true]);
 });
 
 test('it never rejects: a field that throws, a hash that rejects, or something that is not an object gives the scaffold', async () => {
-  const record = buildSummaryRecord(item(1));
+  const record = buildSummaryRecord(item(1), 1);
   const throwing = { ...record };
   Object.defineProperty(throwing, 'metadata', { enumerable: true, get: () => { throw new Error(MARKER); } });
   const proxy = new Proxy({ ...record }, { get: () => { throw new Error(MARKER); } });
   const scaffold = { name: 'rex-conversation', platform: 'gemini', identifier: chatId(1), date: T * 1000 };
-  assert.deepEqual(plain(await redactGemini(throwing, hash)), scaffold, 'a throwing getter');
-  assert.deepEqual(plain(await redactGemini(record, async () => { throw new Error(MARKER); })), scaffold, 'a rejecting hash');
-  assert.deepEqual(await redactGemini(proxy, hash), {}, 'a proxy that throws');
+  assert.deepEqual(plain(await redactGemini(throwing, hash, 1)), scaffold, 'a throwing getter');
+  assert.deepEqual(plain(await redactGemini(record, async () => { throw new Error(MARKER); }, 1)), scaffold, 'a rejecting hash');
+  assert.deepEqual(await redactGemini(proxy, hash, 1), {}, 'a proxy that throws');
   for (const value of [null, undefined, 42, MARKER]) {
-    assert.deepEqual(await redactGemini(value, hash), {}, String(value));
+    assert.deepEqual(await redactGemini(value, hash, 1), {}, String(value));
   }
 });
 
 test('a title hash that is not a SHA-256 hex digest is kept as null', async () => {
   const cases: [string, () => Promise<string | null>][] = [['text', async () => MARKER], ['null', async () => null], ['upper-case hex', async () => 'ABCDEF'.repeat(11).slice(0, 64)]];
   for (const [what, bad] of cases) {
-    const out = await redactGemini(buildSummaryRecord(item(1)), bad);
+    const out = await redactGemini(buildSummaryRecord(item(1), 1), bad, 1);
     assert.equal((out.metadata as unknown[])[1], null, what);
   }
 });
 
 test('a DateString whose instant is held as its ISO string still reads as the record\'s', async () => {
-  const record = buildSummaryRecord(item(1));
-  const out = await redactGemini({ ...record, ended: { value: '2023-11-14T22:13:20Z', originalValue: `number:${T}` } }, hash);
+  const record = buildSummaryRecord(item(1), 1);
+  const out = await redactGemini({ ...record, ended: { value: '2023-11-14T22:13:20Z', originalValue: `number:${T}` } }, hash, 1);
   assert.equal(out.is_summary, true);
 });
 
@@ -209,7 +258,7 @@ test('each turn field is kept only in its form', async () => {
   const other = { ...record.turns[0], speaker: 'system' };
   // Numbers that are not counts: negative, fractional, unsafe.
   const oddNumbers = { ...oddAssistant, when: '2023-11-14T22:13:20Z', citation_count: -1, search_result_count: 2.5, attachments: Number.MAX_SAFE_INTEGER + 2, drafts: 1.5 };
-  const out = await redactGemini({ ...record, turns: [oddUser, oddAssistant, other, oddNumbers] }, hash);
+  const out = await redactGemini({ ...record, turns: [oddUser, oddAssistant, other, oddNumbers] }, hash, 1);
   const [user, assistant, system, numbers] = out.turns as Record<string, unknown>[];
   assert.deepEqual(user, {
     identifier: null, parent: null, speaker: 'user', when: '2023-11-14T22:13:20Z', on_current_branch: null,
@@ -230,8 +279,8 @@ test('a detail record with counts from citations and search results comes back a
     exchange({ chat: chatId(1), response: 1, seconds: T - 120, prompt: '' }),
   ]), chatId(1));
   assert.equal(read.kind, 'read', 'Test setup invalid: the read did not parse');
-  const record = buildDetailRecord(item(1), read as Extract<typeof read, { kind: 'read' }>);
-  assert.deepEqual(plain(await redactGemini(record, hash)), await hashed(record));
+  const record = buildDetailRecord(item(1), read as Extract<typeof read, { kind: 'read' }>, 1);
+  assert.deepEqual(plain(await redactGemini(record, hash, 1)), await hashed(record));
 });
 
 test('records of every shape the builders make come back as they went in', async () => {
@@ -240,29 +289,29 @@ test('records of every shape the builders make come back as they went in', async
   const read = parseRead(readResponse([exchange({ chat: chatId(1), response: 1, seconds: T - 60, nanos: 0 })]), chatId(1));
   assert.equal(read.kind, 'read', 'Test setup invalid: the read did not parse');
   const noDrafts = read as Extract<typeof read, { kind: 'read' }>;
-  cases.push(['drafts null, and a time with no nanoseconds', buildDetailRecord(item(1), { ...noDrafts, exchanges: noDrafts.exchanges.map((exchanged) => ({ ...exchanged, drafts: null })) })]);
+  cases.push(['drafts null, and a time with no nanoseconds', buildDetailRecord(item(1), { ...noDrafts, exchanges: noDrafts.exchanges.map((exchanged) => ({ ...exchanged, drafts: null })) }, 1)]);
   cases.push(['null counts, ids and parent', buildDetailRecord(item(1), {
     ...noDrafts,
     exchanges: noDrafts.exchanges.map((exchanged) => ({ ...exchanged, parentDraftId: null, shownDraftId: null, attachmentTypes: null, prompt: null, reply: { text: null, citations: null, searchResults: null } })),
-  })]);
-  cases.push(['the ten-position list entry', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: listEntry(1, T) })]);
+  }, 1)]);
+  cases.push(['the ten-position list entry', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: listEntry(1, T) }, 1)]);
   const sparse = entry(1);
   delete sparse[3];
-  cases.push(['a list entry with a hole', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: sparse })]);
+  cases.push(['a list entry with a hole', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: sparse }, 1)]);
   const fraction = entry(1, T + 0.5);
-  cases.push(['seconds with a fraction', buildSummaryRecord({ id: chatId(1), endedSec: T + 0.5, entry: fraction })]);
+  cases.push(['seconds with a fraction', buildSummaryRecord({ id: chatId(1), endedSec: T + 0.5, entry: fraction }, 1)]);
   const marked = entry(1);
   marked[2] = 'x_0123456789abcdef';
   marked[3] = 'g_0123456789abcdef';
   marked[4] = [[T, 0], [T + 1, 5]];
   marked[6] = true;
-  cases.push(['list positions holding prefixed hex ids, nested times and a flag', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked })]);
+  cases.push(['list positions holding prefixed hex ids, nested times and a flag', buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked }, 1)]);
   // A chat whose oldest exchange moved after the list call: no start.
   const moved = parseRead(readResponse([exchange({ chat: chatId(1), response: 1, seconds: T + 5 })]), chatId(1));
   assert.equal(moved.kind, 'read', 'Test setup invalid: the read did not parse');
-  cases.push(['a detail record whose oldest exchange is after the listed end', buildDetailRecord(item(1), moved as Extract<typeof moved, { kind: 'read' }>)]);
+  cases.push(['a detail record whose oldest exchange is after the listed end', buildDetailRecord(item(1), moved as Extract<typeof moved, { kind: 'read' }>, 1)]);
   for (const [what, record] of cases) {
-    const out = await redactGemini(record, hash);
+    const out = await redactGemini(record, hash, 1);
     const expected = plain(record);
     expected.metadata[1] = await hash('Title 1');
     assert.deepEqual(plain(out), expected, what);
@@ -273,7 +322,7 @@ test('a chat the list parser gives always reads as a record', async () => {
   const page = parseListPage(batchResponse(wrb('MaZiqc', [null, null, [entry(1), listEntry(2, T)]])));
   assert.ok(page.kind === 'page' && page.items.length === 2, 'Test setup invalid: the page did not parse');
   for (const listed of page.items) {
-    assert.equal((await redactGemini(buildSummaryRecord(listed), hash)).is_summary, true, listed.id);
+    assert.equal((await redactGemini(buildSummaryRecord(listed, 1), hash, 1)).is_summary, true, listed.id);
   }
 });
 
@@ -283,7 +332,7 @@ test('a string at a list position is kept only as a prefixed hex id', async () =
   for (const [value, kept] of cases) {
     const marked = entry(1);
     marked[2] = value;
-    const out = await redactGemini(buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked }), hash);
+    const out = await redactGemini(buildSummaryRecord({ id: chatId(1), endedSec: T, entry: marked }, 1), hash, 1);
     assert.equal((out.metadata as unknown[])[2], kept ? value : null, value);
   }
 });

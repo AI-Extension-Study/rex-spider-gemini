@@ -383,3 +383,69 @@ test('served account enabled, a crawl reads Gemini Apps Activity before the list
   }))
   expect(traffic.urls.filter((url) => !allowed.some((pattern) => new RegExp(pattern).test(url)))).toEqual([])
 })
+
+// Whether rex-core holds each upload key, as rex-spider names them: the id
+// the spider gives, then the last-message time in ms.
+async function heldKeys(serviceWorker, ids: [string, number][]) {
+  return serviceWorker.evaluate((keys) => Promise.all(keys.map((key) => new Promise((resolve) => {
+    self.rexCorePlugin.handleMessage({ messageType: 'fetchValue', key }, null, (value) => resolve(value !== null))
+  }))), ids.map(([id, seconds]) => `rex-spider-gemini-conversation-upload-${id}-${seconds * 1000}`))
+}
+
+// The extension that bundles this module serves data_format in the spider's
+// block. A block without it, or with anything but a whole number from 1 to
+// 999, is format 1: today's keys and records.
+test('served data_format 2, the next crawl sends every chat again as format 2 under -f2 keys, and one without it is format 1 again', async ({ context, serviceWorker }) => {
+  test.setTimeout(60_000)
+  await answerGemini(context, [entry(1, T), entry(2, T + 60)])
+  await untilStoreOpen(serviceWorker)
+  await configure(serviceWorker, { summarize: true })
+
+  const first = await crawl(serviceWorker)
+  expect(records(first.events)).toEqual([summary(2, T + 60, iso(T + 60)), summary(1, T, iso(T))])
+  expect(await heldKeys(serviceWorker, [[chat(1), T], [chat(2), T + 60], [`${chat(1)}-f2`, T], [`${chat(2)}-f2`, T + 60]])).toEqual([true, true, false, false])
+
+  for (const data_format of [0, -1, 1.5, '2', null, 1000]) {
+    await configure(serviceWorker, { summarize: true, data_format })
+    const round = await crawl(serviceWorker)
+    expect(records(round.events), `data_format ${JSON.stringify(data_format)}`).toEqual([])
+  }
+
+  await configure(serviceWorker, { summarize: true, data_format: 2 })
+  const second = await crawl(serviceWorker)
+  expect(records(second.events)).toEqual([{ ...summary(2, T + 60, iso(T + 60)), format_version: 2 }, { ...summary(1, T, iso(T)), format_version: 2 }])
+  expect(completions(second.events)).toEqual([[2, [chat(1), chat(2)], 'Fetch successful.']])
+  expect(await heldKeys(serviceWorker, [[`${chat(1)}-f2`, T], [`${chat(2)}-f2`, T + 60]])).toEqual([true, true])
+
+  const third = await crawl(serviceWorker)
+  expect(records(third.events)).toEqual([])
+
+  await configure(serviceWorker, { summarize: true })
+  const fourth = await crawl(serviceWorker)
+  expect(records(fourth.events)).toEqual([])
+})
+
+// The browsers already served detail under format 1, whose mode stays the
+// same: under format 2 every chat is read and sent again, and the account
+// record carries the new format too.
+test('served detail before and after, data_format 2 reads every chat again and sends detail and account records of format 2, once', async ({ context, serviceWorker }) => {
+  test.setTimeout(60_000)
+  const traffic = await answerGemini(context, [entry(1, T), entry(2, T + 60)], { activity: true })
+  await untilStoreOpen(serviceWorker)
+  await configure(serviceWorker)
+
+  const first = await crawl(serviceWorker)
+  expect(records(first.events)).toEqual([detail(2, T + 60), detail(1, T)])
+  traffic.calls.splice(0)
+
+  await configure(serviceWorker, { data_format: 2, account: { enabled: true } })
+  const second = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual(['GET /app', ACCOUNT_CALL, OTHER_LIST, MAIN_LIST, READ_CALL(2), READ_CALL(1)])
+  expect(records(second.events)).toEqual([{ ...detail(2, T + 60), format_version: 2 }, { ...detail(1, T), format_version: 2 }])
+  expect(accounts(second.events).map((record) => [record.format_version, record.history_saved])).toEqual([[2, true]])
+  expect(await heldKeys(serviceWorker, [[`${chat(1)}-detail-f2`, T], [`${chat(2)}-detail-f2`, T + 60]])).toEqual([true, true])
+
+  const third = await crawl(serviceWorker)
+  expect(traffic.calls.splice(0)).toEqual(ONE_CRAWL)
+  expect(records(third.events)).toEqual([])
+})
