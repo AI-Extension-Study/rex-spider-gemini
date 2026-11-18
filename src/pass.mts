@@ -16,7 +16,7 @@ import { READ_RPC, type ReadResult, parseRead, readArgs } from './read.mts';
 import { DETAIL_FAILED, DISABLED, FETCH_SUCCESSFUL, NO_RESULTS, NO_TOKEN, PARTIAL, SERVER_WAIT, STORE_SILENT, homepageFailed, homepageUnreachable, listFailed } from './reasons.mts';
 import { type GeminiRecord, buildDetailRecord, buildSummaryRecord } from './record.mts';
 import { type DetailMemo, type GeminiStore, type Mode } from './store.mts';
-import { type WalkStop, walkList } from './walk.mts';
+import { type WalkStop, type WalkToken, walkList } from './walk.mts';
 import { bardErrorCodes, batchBody, batchUrl, pageToken } from './wire.mts';
 
 export const HOME_URL = 'https://gemini.google.com/app';
@@ -74,10 +74,11 @@ export interface PassLimits {
   // share.
   readonly failedRun: number;
   // The age past which the page token is read again from the homepage
-  // before the next detail read. How long Google keeps a token valid has not
-  // been measured, and a detail pass can run for hours. Reads made with one
-  // that had gone stale would fail, and their chats would get summaries and
-  // memos in place of detail records.
+  // before the next list call or detail read. How long Google keeps a token
+  // valid has not been measured, and a walk of a long history (about 60
+  // pages at the 30 s pace) or a detail pass can run past it. List calls
+  // made with one that had gone stale would end the walk, and reads would
+  // fail, their chats getting summaries and memos in place of detail records.
   readonly tokenAgeMs: number;
 }
 
@@ -132,24 +133,37 @@ async function step<T>(call: () => Promise<T>, ms: number, keepAlive: () => unkn
   return answer;
 }
 
-// The walk's stop as the outcome this spider has always reported: an error
-// sends nothing, except that an HTTP error or an expired session after chats
-// in the window were listed send those, as a partial pass. Before any was
-// listed they are errors too, with no reading.
+// The walk's stop as the outcome of the pass. Once a chat in the window was
+// listed, a failed list call, whatever the failure, or a page token that
+// cannot be read again keeps the chats listed before it and sends them, as a
+// partial pass: on a long history the stop comes many pages in, and every
+// chat on the earlier pages was read. Before any was listed, the first list
+// call included, a failed call is an error with its own reason and no
+// reading, and a token stop reports no reading as NO_RESULTS.
 function stopReason(stop: WalkStop, inWindow: number): string | null {
   switch (stop.kind) {
     case 'not-a-list':
-      return listFailed('Received invalid response for conversation API');
+      return inWindow === 0 ? listFailed('Received invalid response for conversation API') : null;
     case 'timeout':
     case 'network':
-      return listFailed(`Unable to crawl the conversation list (${stop.kind})`);
+      return inWindow === 0 ? listFailed(`Unable to crawl the conversation list (${stop.kind})`) : null;
     case 'http':
       return inWindow === 0 ? listFailed(`List fetch failed (status ${stop.status})`) : null;
     case 'expired':
       return inWindow === 0 ? listFailed('Session expired') : null;
     case 'disabled':
       return DISABLED;
+    case 'token':
+      return null;
   }
+}
+
+// The page token and when it was read from the homepage (epoch ms). The walk
+// and the detail reads share one, so the reads start with the token the walk
+// last read.
+interface PageToken {
+  at: string;
+  atRead: number;
 }
 
 // What the sending of a pass shares.
@@ -157,9 +171,7 @@ interface Sending {
   readonly deps: PassDeps;
   readonly limits: PassLimits;
   readonly log: (line: string) => void;
-  // The page token, and when it was read from the homepage (epoch ms).
-  readonly at: string;
-  readonly atRead: number;
+  readonly token: PageToken;
 }
 
 interface Sent {
@@ -261,6 +273,26 @@ function tokenFrom(home: Answer): { readonly at: string } | { readonly failure: 
   return at === null ? { failure: 'no token' } : { at };
 }
 
+// The page token for the next list call or detail read. One older than
+// tokenAgeMs is read again from the homepage first. A token that cannot be
+// read again (signed out, refused, no answer) stops the caller. After a
+// re-read, enabled is read again for the request that follows, as before
+// every request.
+async function currentToken(deps: PassDeps, limits: PassLimits, log: (line: string) => void, token: PageToken): Promise<WalkToken> {
+  if (deps.now() - token.atRead <= limits.tokenAgeMs) {
+    return { at: token.at };
+  }
+  const read = tokenFrom(await deps.client.get(HOME_URL));
+  if (!('at' in read)) {
+    log(`the page token could not be read again (${read.failure})`);
+    return { stop: 'token' };
+  }
+  log('the page token was read again');
+  token.at = read.at;
+  token.atRead = deps.now();
+  return deps.framework.isEnabled() ? { at: token.at } : { stop: 'disabled' };
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // When a chat whose read failed is read again: a day after a first failure
@@ -319,7 +351,6 @@ const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
   const { client, framework, store } = deps;
-  let { at, atRead } = ctx;
   const started = deps.now();
   // The time spent in the waits between reads, which the budget leaves out.
   let waited = 0;
@@ -365,21 +396,15 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       log('summary mode was served during the detail reads; a later pass sends the chats not read');
       break;
     }
-    if (deps.now() - atRead > limits.tokenAgeMs) {
-      const token = tokenFrom(await client.get(HOME_URL));
-      if (!('at' in token)) {
-        log(`the page token could not be read again (${token.failure}); the chats not read are read in a later pass`);
-        break;
-      }
-      log('the page token was read again');
-      at = token.at;
-      atRead = deps.now();
-      // Enabled is read again for the read that follows, as before every request.
-      if (!framework.isEnabled()) {
+    const token = await currentToken(deps, limits, log, ctx.token);
+    if ('stop' in token) {
+      if (token.stop === 'disabled') {
         return { sent, disabled: true, stopped: null };
       }
+      log('the chats not read are read in a later pass');
+      break;
     }
-    const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), at));
+    const answer = await client.postForm(batchUrl(READ_RPC, deps.requestId), batchBody(READ_RPC, readArgs(item.id), token.at));
     const read = answer.kind === 'ok' && answer.status >= 200 && answer.status <= 299 ? parseRead(answer.text, item.id) : null;
     if (read !== null && read.kind === 'read') {
       failedInARow = 0;
@@ -565,13 +590,13 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
 
     await readAccount(deps, at, limits, log);
 
-    const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at, requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
+    const token: PageToken = { at, atRead };
+    const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at: () => currentToken(deps, limits, log, token), requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
 
     const crawledIds: string[] = [];
     const unsent: ListItem[] = [];
     const transmitted = (id: string, ended: DateString) => step(() => framework.checkIfAlreadyTransmitted(id, ended), limits.storeMs, deps.keepAlive, log);
-    const stopsBeforeSending = walk.stop !== null && ['not-a-list', 'timeout', 'network', 'disabled'].includes(walk.stop.kind);
-    if (!stopsBeforeSending) {
+    if (walk.stop?.kind !== 'disabled') {
       for (const item of walk.items) {
         const { ended } = buildSummaryRecord(item);
         if (!(await step(() => framework.crawlWindowContains(ended.timestamp()), limits.storeMs, deps.keepAlive, log))) {
@@ -591,6 +616,8 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
       if (reason !== null) {
         return failed(reason);
       }
+      // The reason only says the pass is partial; the log says why.
+      log(`the list walk stopped early (${walk.stop.kind})`);
     }
     if (!walk.complete && crawledIds.length === 0) {
       return failed(NO_RESULTS);
@@ -598,7 +625,7 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
 
     // Newest first, so a pass cut short has sent the most recent chats.
     unsent.sort((a, b) => b.endedSec - a.endedSec);
-    const ctx: Sending = { deps, limits, log, at, atRead };
+    const ctx: Sending = { deps, limits, log, token };
     const { sent, disabled, stopped } = served === 'summary'
       ? await sendSummaries(ctx, unsent.map((item) => buildSummaryRecord(item)))
       : await sendDetails(ctx, unsent);

@@ -21,10 +21,12 @@ The extension starts a crawl round every minute, but only while an ID is stored 
 
 1. Read `https://gemini.google.com/app` for the page token (`SNlM0e`) the site's own requests carry. A page without one ends the pass.
 2. If the account read is on and due, make its one call (see "The account record").
-3. Walk the chat list: the `MaZiqc` call to `/_/BardChatUi/data/batchexecute`, 10 chats a page, in two list calls (`[1,null,1]`, then `[0,null,1]`), each followed to its last page on every pass, `crawl_delay` between pages. A chat both calls list counts once.
+3. Walk the chat list: the `MaZiqc` call to `/_/BardChatUi/data/batchexecute`, 10 chats a page, in two list calls (`[1,null,1]`, then `[0,null,1]`), each followed to its last page on every pass, `crawl_delay` between pages. A chat both calls list counts once. The walk does not stop at the crawl window, since neither list's order is confirmed.
 4. Keep the chats whose last message falls in the crawl window and that have no upload key in the served mode (see "Modes and the re-send"). They go out newest first.
-5. Summary mode sends the list entries as records, 25 at a time. Detail mode reads each chat with the `hNvQHb` call, which returns its newest 200 exchanges, `crawl_delay` apart and never closer than 3 s, and reads the page token again once it is 30 minutes old.
+5. Summary mode sends the list entries as records, 25 at a time. Detail mode reads each chat with the `hNvQHb` call, which returns its newest 200 exchanges, `crawl_delay` apart and never closer than 3 s.
 6. Send one completion event (see "Reading the completion events").
+
+The page token is read again from `/app` before the next list call or detail read once it is 30 minutes old (a walk of about 60 pages at the 30 s pace), and the detail reads go on with the one the walk last read.
 
 Detail reads stop once a pass has spent 360 s reading (requests, parsing and storage calls; the waits do not count), counted from its first read. Chats not reached keep no key and go out in a later pass. Waits run in steps of at most 20 s with a cheap extension call before each, every request gives up after 20 s, and a list is cut after 1,000 pages or 3 pages in a row that bring no new chat.
 
@@ -68,6 +70,7 @@ A record goes out when the call answered HTTP 200 with the flag, and it differs 
 
 ## When something fails
 
+- A list call that fails once a chat in the window was listed (an HTTP error, no answer within 20 s, a network error, an answer that is not a list, an expired session), or a page token that cannot be read again during the walk, ends the walk: the chats listed go out and the pass reports partial. A failed call before then, the first list call included, ends the pass with its error and -1.
 - A failed detail read sends the chat's summary record in the detail's place, once per last-message time, unless one already went out at that time. The chat then waits 1 day before the next try after a first failure that may pass by itself (no answer, a 5xx, a 429) and 7 days otherwise; a chat with a newer last message is read at once.
 - Failed reads also end the pass's reads, as `halt_on_error` sets (see "Settings it reads"). A 429 or a 503 ends them at once, so under a lasting rate limit each pass tries one chat and each chat still gets its summary. An expired session (error code 1096 in Gemini's answer) ends them with no wait for the chat.
 
@@ -83,7 +86,7 @@ Each pass sends one event, `rex-spider-gemini-complete`, with `crawled_count`, `
 | `Crawl stopped: spider disabled.` | -1 if switched off before the list was read, else records sent and the chats listed |
 | `No access token found on homepage.` | -1: not signed in |
 | `Homepage fetch failed (status N).`, `Error encountered fetching network resource: timeout.` (or `network.`) | -1 |
-| `Error encountered parsing conversations: ...` | -1: the list failed, the session expired before any chat was listed, the list was read only in part and gave no chat in the window, or the pass hit an unexpected error (`internal error (<kind>)`) |
+| `Error encountered parsing conversations: ...` | -1: a list call failed or the session expired before any chat in the window was listed, the list was read only in part and gave no chat in the window, or the pass hit an unexpected error (`internal error (<kind>)`) |
 | `Crawl stopped: the extension storage did not answer.` | -1 |
 | `[gemini] Still crawling.` | -1; sent by rex-spider each minute a pass is still running, not a pass |
 

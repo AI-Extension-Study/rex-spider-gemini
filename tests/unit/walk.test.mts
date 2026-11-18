@@ -150,6 +150,16 @@ test('an answer that stops the walk keeps what came before and names why', async
   }
 });
 
+test('a token function is asked before each list call, its token goes with the call, and a stop it gives ends the walk there', async () => {
+  for (const stop of ['token', 'disabled'] as const) {
+    const fake = server({ [key(OTHER, null)]: page([entry(1)], 'B2'), [key(OTHER, 'B2')]: page([entry(2)]), [key(MAIN, null)]: page([entry(3)]) });
+    const tokens = [{ at: 'T1' }, { at: 'T2' }, { stop }];
+    const result = await walkList({ client: fake.client, sleep: async () => {}, crawlDelay: () => 0, at: async () => tokens.shift() ?? { at: 'NONE' }, requestId: 1, log: () => {} });
+    assert.deepEqual(fake.sent.map((call) => call.at), ['T1', 'T2'], stop);
+    assert.deepEqual({ ids: ids(result.items), complete: result.complete, stop: result.stop }, { ids: [chatId(1), chatId(2)], complete: false, stop: { kind: stop } }, stop);
+  }
+});
+
 test('a chat listed in both variants at one time is returned once, with the entry the main list gave it', async () => {
   const pinned = listEntry(1, 1700000000);
   const main = [...listEntry(1, 1700000000).slice(0, 9), 0];

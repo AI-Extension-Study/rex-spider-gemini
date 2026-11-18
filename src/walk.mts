@@ -27,7 +27,12 @@ export type WalkStop =
   | { readonly kind: 'network' }
   | { readonly kind: 'expired' }
   // The served config switched the spider off during the walk.
-  | { readonly kind: 'disabled' };
+  | { readonly kind: 'disabled' }
+  // The page token could not be read again before a list call.
+  | { readonly kind: 'token' };
+
+// The page token for the next list call, or why the walk stops before it.
+export type WalkToken = { readonly at: string } | { readonly stop: 'token' | 'disabled' };
 
 export interface WalkResult {
   // Each chat once, in the order first listed. A chat both lists give
@@ -45,7 +50,9 @@ export interface WalkDeps {
   readonly client: Pick<Client, 'postForm'>;
   readonly sleep: (ms: number) => Promise<void>;
   readonly crawlDelay: () => number;
-  readonly at: string;
+  // The page token every list call carries, or a function asked for it
+  // before each call, after the enabled check.
+  readonly at: string | (() => Promise<WalkToken>);
   readonly requestId: number;
   readonly maxPages?: number;
   // Read before each list call; false stops the walk there.
@@ -73,8 +80,12 @@ export async function walkList({ client, sleep, crawlDelay, at, requestId, maxPa
       if (!enabled()) {
         return result({ kind: 'disabled' });
       }
+      const token = typeof at === 'string' ? { at } : await at();
+      if ('stop' in token) {
+        return result({ kind: token.stop });
+      }
       calls += 1;
-      const answer = await client.postForm(url, batchBody(LIST_RPC, [PAGE_SIZE, cursor, variant], at));
+      const answer = await client.postForm(url, batchBody(LIST_RPC, [PAGE_SIZE, cursor, variant], token.at));
       if (answer.kind !== 'ok') {
         return result({ kind: answer.kind });
       }
