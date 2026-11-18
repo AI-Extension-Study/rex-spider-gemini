@@ -26,7 +26,7 @@ The extension starts a crawl round every minute, but only while an ID is stored 
 5. Summary mode sends the list entries as records, 25 at a time. Detail mode reads each chat with the `hNvQHb` call, which returns its newest 200 exchanges, `crawl_delay` apart and never closer than 3 s.
 6. Send one completion event (see "Reading the completion events").
 
-The page token is read again from `/app` before the next list call or detail read once it is 30 minutes old (a walk of about 60 pages at the 30 s pace), and the detail reads go on with the one the walk last read.
+The page token is read again from `/app` before the next list call or detail read once it is 25 minutes old (a walk of about 50 pages at the 30 s pace), and the detail reads go on with the one the walk last read. How long Google keeps a token has not been measured; on one account passes failed at about 33 minutes of pass time, so 25 leaves a margin. The next request waits `crawl_delay` after the re-read (in detail mode, never less than 3 s).
 
 Detail reads stop once a pass has spent 360 s reading (requests, parsing and storage calls; the waits do not count), counted from its first read. Chats not reached keep no key and go out in a later pass. Waits run in steps of at most 20 s with a cheap extension call before each, every request gives up after 20 s, and a list is cut after 1,000 pages or 3 pages in a row that bring no new chat.
 
@@ -70,7 +70,7 @@ A record goes out when the call answered HTTP 200 with the flag, and it differs 
 
 ## When something fails
 
-- A list call that fails once a chat in the window was listed (an HTTP error, no answer within 20 s, a network error, an answer that is not a list, an expired session), or a page token that cannot be read again during the walk, ends the walk: the chats listed go out and the pass reports partial. A failed call before then, the first list call included, ends the pass with its error and -1.
+- A list call that fails once a chat in the window was listed (an HTTP error, no answer within 20 s, a network error, an answer that is not a list, an expired session), or a page token that cannot be read again during the walk, ends the walk: the chats listed go out and the pass reports partial. A failed call before then, the first list call included, ends the pass with its error and -1. In detail mode, after a list call with no answer, not a list or an HTTP error, the reads first read the page token again; if that fails, no chat is read and none gets a memo, so all wait for a later pass.
 - A failed detail read sends the chat's summary record in the detail's place, once per last-message time, unless one already went out at that time. The chat then waits 1 day before the next try after a first failure that may pass by itself (no answer, a 5xx, a 429) and 7 days otherwise; a chat with a newer last message is read at once.
 - Failed reads also end the pass's reads, as `halt_on_error` sets (see "Settings it reads"). A 429 or a 503 ends them at once, so under a lasting rate limit each pass tries one chat and each chat still gets its summary. An expired session (error code 1096 in Gemini's answer) ends them with no wait for the chat.
 

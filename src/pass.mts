@@ -75,14 +75,16 @@ export interface PassLimits {
   readonly failedRun: number;
   // The age past which the page token is read again from the homepage
   // before the next list call or detail read. How long Google keeps a token
-  // valid has not been measured, and a walk of a long history (about 60
-  // pages at the 30 s pace) or a detail pass can run past it. List calls
-  // made with one that had gone stale would end the walk, and reads would
-  // fail, their chats getting summaries and memos in place of detail records.
+  // valid has not been measured; on one account with a long history, passes
+  // failed at about 33 minutes of pass time, so 25 minutes leaves a margin
+  // below that. A walk of a long history (about 50 pages at the 30 s pace)
+  // or a detail pass can run past it. List calls made with a stale token
+  // would end the walk, and reads would fail, their chats getting summaries
+  // and memos in place of detail records.
   readonly tokenAgeMs: number;
 }
 
-export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: 30 * 60 * 1000 };
+export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: 25 * 60 * 1000 };
 
 export interface PassDeps {
   readonly client: Pick<Client, 'get' | 'postForm'>;
@@ -160,10 +162,11 @@ function stopReason(stop: WalkStop, inWindow: number): string | null {
 
 // The page token and when it was read from the homepage (epoch ms). The walk
 // and the detail reads share one, so the reads start with the token the walk
-// last read.
+// last read. stale: read it again before the next request, whatever its age.
 interface PageToken {
   at: string;
   atRead: number;
+  stale: boolean;
 }
 
 // What the sending of a pass shares.
@@ -260,8 +263,8 @@ function readFailure(answer: Answer, read: Exclude<ReadResult, { kind: 'read' }>
   return read.kind === 'error' ? `error frame, code ${read.code}` : 'not a read';
 }
 
-// The page token from a homepage read again during the detail reads, or what
-// went wrong, for the log.
+// The page token from a homepage read again during the walk or the detail
+// reads, or what went wrong, for the log.
 function tokenFrom(home: Answer): { readonly at: string } | { readonly failure: string } {
   if (home.kind !== 'ok') {
     return { failure: home.kind };
@@ -274,12 +277,13 @@ function tokenFrom(home: Answer): { readonly at: string } | { readonly failure: 
 }
 
 // The page token for the next list call or detail read. One older than
-// tokenAgeMs is read again from the homepage first. A token that cannot be
-// read again (signed out, refused, no answer) stops the caller. After a
-// re-read, enabled is read again for the request that follows, as before
-// every request.
-async function currentToken(deps: PassDeps, limits: PassLimits, log: (line: string) => void, token: PageToken): Promise<WalkToken> {
-  if (deps.now() - token.atRead <= limits.tokenAgeMs) {
+// tokenAgeMs, or marked stale, is read again from the homepage first. A
+// token that cannot be read again (signed out, refused, no answer) stops the
+// caller. The homepage read is a request like any other, so the caller's
+// wait (pause) follows it before the next one, and enabled is read again
+// after that wait, as before every request.
+async function currentToken(deps: PassDeps, limits: PassLimits, log: (line: string) => void, token: PageToken, pause: () => Promise<void>): Promise<WalkToken> {
+  if (!token.stale && deps.now() - token.atRead <= limits.tokenAgeMs) {
     return { at: token.at };
   }
   const read = tokenFrom(await deps.client.get(HOME_URL));
@@ -290,6 +294,8 @@ async function currentToken(deps: PassDeps, limits: PassLimits, log: (line: stri
   log('the page token was read again');
   token.at = read.at;
   token.atRead = deps.now();
+  token.stale = false;
+  await pause();
   return deps.framework.isEnabled() ? { at: token.at } : { stop: 'disabled' };
 }
 
@@ -346,8 +352,9 @@ const written = (ctx: Sending, due: Pending): Promise<boolean> => (due.kind === 
 // summary, and the records already sent keep the keys they went out under.
 //
 // The page token is read again from the homepage before a read once it is
-// older than tokenAgeMs. A token that cannot be read again (signed out,
-// refused, no answer) ends the reads as an expired session does.
+// older than tokenAgeMs, or stale after the walk's stop (runPass), and the
+// read waits as after any request. A token that cannot be read again (signed
+// out, refused, no answer) ends the reads as an expired session does.
 async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Sent> {
   const { deps, limits, log } = ctx;
   const { client, framework, store } = deps;
@@ -396,7 +403,12 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       log('summary mode was served during the detail reads; a later pass sends the chats not read');
       break;
     }
-    const token = await currentToken(deps, limits, log, ctx.token);
+    // The wait after a re-read is waiting too, not reading.
+    const token = await currentToken(deps, limits, log, ctx.token, async () => {
+      const pauseFrom = deps.now();
+      await deps.sleep(Math.max(paceMs(framework), limits.settleMs));
+      waited += deps.now() - pauseFrom;
+    });
     if ('stop' in token) {
       if (token.stop === 'disabled') {
         return { sent, disabled: true, stopped: null };
@@ -590,8 +602,8 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
 
     await readAccount(deps, at, limits, log);
 
-    const token: PageToken = { at, atRead };
-    const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at: () => currentToken(deps, limits, log, token), requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
+    const token: PageToken = { at, atRead, stale: false };
+    const walk = await walkList({ client, sleep: deps.sleep, crawlDelay: () => framework.fetchCrawlDelay(), at: () => currentToken(deps, limits, log, token, () => deps.sleep(paceMs(framework))), requestId: deps.requestId, enabled: () => framework.isEnabled(), log });
 
     const crawledIds: string[] = [];
     const unsent: ListItem[] = [];
@@ -618,6 +630,16 @@ export async function runPass(deps: PassDeps): Promise<PassOutcome> {
       }
       // The reason only says the pass is partial; the log says why.
       log(`the list walk stopped early (${walk.stop.kind})`);
+      // A list call with no answer, not a list (a sign-in page answered with
+      // HTTP 200 among them) or an HTTP error may mean the reads would be
+      // answered the same way, each costing its chat a summary in place of
+      // the detail and a hold of 1 to 7 days. So the reads first read the
+      // token again, and a failed re-read ends them with no memo. They are
+      // not skipped: an account whose walk always stops late would then
+      // never get a detail record.
+      if (['timeout', 'network', 'not-a-list', 'http'].includes(walk.stop.kind)) {
+        token.stale = true;
+      }
     }
     if (!walk.complete && crawledIds.length === 0) {
       return failed(NO_RESULTS);
