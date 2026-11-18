@@ -1,6 +1,7 @@
-// The account record (rex-account, format 1), the layout the AI crawlers
-// share for account settings, and when it is read and sent. Gemini fills one
-// key, history_saved, from Gemini Apps Activity: the site's ESY5D call with
+// The account record (rex-account), the layout the AI crawlers share for
+// account settings, and when it is read and sent. Its format_version is the
+// data format the pass runs under (format.mts). Gemini fills one key,
+// history_saved, from Gemini Apps Activity: the site's ESY5D call with
 // [null,[5]] answers [[null,null,null,null,<bool>]]. No source was found for
 // the other standard keys, so they are null. Pure but for the hash, which is
 // the SHA-256 of crypto.subtle, in the service worker as under Node.
@@ -12,7 +13,7 @@ export const ACCOUNT_ARGS: readonly unknown[] = [null, [5]];
 export interface AccountRecord {
   readonly name: 'rex-account';
   readonly platform: 'gemini';
-  readonly format_version: 1;
+  readonly format_version: number;
   // Epoch ms of the read.
   readonly date: number;
   readonly plan: string | null;
@@ -92,7 +93,8 @@ function sortedKeys(value: unknown): unknown {
 }
 
 // SHA-256 hex of the record without its date, keys sorted at every level, so
-// two reads of the same settings hash alike.
+// two reads of the same settings hash alike. format_version is hashed, so the
+// first read under a new data format sends its record.
 export async function accountHash(record: AccountRecord): Promise<string> {
   const undated: Record<string, unknown> = { ...record };
   delete undated.date;
@@ -120,11 +122,11 @@ export function parseActivity(body: string): boolean | null {
   return typeof slots[4] === 'boolean' ? slots[4] : null;
 }
 
-export function buildGeminiAccount(status: number, historySaved: boolean | null, now: number): AccountRecord {
+export function buildGeminiAccount(status: number, historySaved: boolean | null, now: number, format: number): AccountRecord {
   return {
     name: 'rex-account',
     platform: 'gemini',
-    format_version: 1,
+    format_version: format,
     date: now,
     plan: null,
     paid: null,

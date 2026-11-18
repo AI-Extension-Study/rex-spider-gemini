@@ -1,14 +1,16 @@
 // The Gemini case of the extension's content processor, which calls
 // redactGemini for platform 'gemini' on every rex-conversation point before
 // it is queued for upload. A record buildSummaryRecord or buildDetailRecord
-// made, in the standard record layout (format 1), comes back as it went in,
-// with the title at metadata[1] replaced by the hash hashTitle gives, each
-// field written from its checked value. Any other event keeps only the
-// scaffold: the fields the processor keeps for a point of no known platform,
-// each in its form. The case never rejects, because rex-content-processing
-// uploads a rejected processor's input unredacted. The extension carries a
-// copy of this file, made for the commit its lockfile pins, so it imports
-// nothing but rex-types. Pure.
+// made, in the standard record layout, whose format_version is the format
+// the caller accepts, comes back as it went in, with the title at metadata[1]
+// replaced by the hash hashTitle gives, each field written from its checked
+// value. Any other event, a record of another format included, keeps only
+// the scaffold: the fields the processor keeps for a point of no known
+// platform, each in its form. The case never rejects, because
+// rex-content-processing uploads a rejected processor's input unredacted. The
+// extension carries a copy of this file, made for the commit its lockfile
+// pins, so it imports nothing but rex-types, and it holds no format number of
+// its own: the extension passes the one it sets in every crawler. Pure.
 import { DateString } from '@bric/rex-types/types';
 
 const NAME = 'rex-conversation';
@@ -23,7 +25,6 @@ export const isChatId = (value: unknown): value is string => typeof value === 's
 // A turn's id or parent: an exchange's response id or a draft's id.
 const isTurnId = (value: unknown): value is string => typeof value === 'string' && (RESPONSE_ID.test(value) || DRAFT_ID.test(value));
 
-const FORMAT_VERSION = 1;
 const SPEAKERS: ReadonlySet<string> = new Set(['user', 'assistant']);
 
 // The form the scaffold keeps a name, a platform or a generator id in: PDK's
@@ -178,13 +179,15 @@ function keepTurn(turn: Readonly<Record<string, unknown>>): Record<string, unkno
   return kept;
 }
 
-/** The record for a record record.mts built, else the scaffold; never rejects. */
-export async function redactGemini(event: unknown, hashTitle: (title: unknown) => Promise<string | null>): Promise<Record<string, unknown>> {
+/** The record for a record record.mts built in the accepted format, else the scaffold; never rejects. */
+export async function redactGemini(event: unknown, hashTitle: (title: unknown) => Promise<string | null>, format: number): Promise<Record<string, unknown>> {
   const fields = Object.fromEntries(FIELDS.map((key) => [key, readOwn(event, key)]));
   const scaffold = Object.fromEntries(Object.entries(SCAFFOLD).filter(([key, holds]) => holds(fields[key])).map(([key]) => [key, fields[key]]));
   try {
     const { name, platform, identifier, date, is_summary: isSummary, format_version: version, turns, turns_complete: complete, metadata, started } = fields;
-    if (name !== NAME || platform !== PLATFORM || !isChatId(identifier) || typeof isSummary !== 'boolean' || version !== FORMAT_VERSION
+    // An accepted format that is not a number accepts nothing, a record
+    // without a format included.
+    if (name !== NAME || platform !== PLATFORM || !isChatId(identifier) || typeof isSummary !== 'boolean' || typeof format !== 'number' || version !== format
       || !Array.isArray(turns) || (isSummary && turns.length !== 0) || !Array.isArray(metadata) || metadata[0] !== identifier) {
       return scaffold;
     }
@@ -216,7 +219,7 @@ export async function redactGemini(event: unknown, hashTitle: (title: unknown) =
     return {
       ...scaffold,
       is_summary: isSummary,
-      format_version: FORMAT_VERSION,
+      format_version: format,
       turns: objects.map((turn) => keepTurn(turn)),
       // A turn dropped here leaves the turns incomplete.
       ...(isSummary ? {} : { turns_complete: complete === true && objects.length === turns.length }),

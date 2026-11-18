@@ -92,20 +92,36 @@ test('a detail memo reads back as written, and clearing it writes null', async (
   const core = rexCore();
   const store = createStore(core.handleMessage, { log: quiet });
   const memo = { ended: 1700000000000, at: 1700000100000, retryMs: 86_400_000, failures: 1 };
-  await store.memo.set('c_0000000000000001', memo);
-  assert.deepEqual(await store.memo.get('c_0000000000000001'), { value: memo, unanswered: false, malformed: false });
-  await store.memo.clear('c_0000000000000001');
-  assert.equal(core.values.get(memoKey('c_0000000000000001')), null);
-  assert.deepEqual(await store.memo.get('c_0000000000000001'), { value: null, unanswered: false, malformed: false });
-  core.values.set(memoKey('c_0000000000000002'), { ended: 1, at: 1, retryMs: 0, failures: 1 });
-  assert.deepEqual(await store.memo.get('c_0000000000000002'), { value: null, unanswered: false, malformed: true });
+  await store.memo.set('c_0000000000000001', memo, 1);
+  assert.deepEqual(await store.memo.get('c_0000000000000001', 1), { value: memo, unanswered: false, malformed: false });
+  await store.memo.clear('c_0000000000000001', 1);
+  assert.equal(core.values.get(memoKey('c_0000000000000001', 1)), null);
+  assert.deepEqual(await store.memo.get('c_0000000000000001', 1), { value: null, unanswered: false, malformed: false });
+  core.values.set(memoKey('c_0000000000000002', 1), { ended: 1, at: 1, retryMs: 0, failures: 1 });
+  assert.deepEqual(await store.memo.get('c_0000000000000002', 1), { value: null, unanswered: false, malformed: true });
+});
+
+test('a memo is kept per data format: under format 2 its key adds -f2, and a memo of one format is not read under another', async () => {
+  const core = rexCore();
+  const store = createStore(core.handleMessage, { log: quiet });
+  const one = { ended: 1700000000000, at: 1700000100000, retryMs: 86_400_000, failures: 1 };
+  const two = { ...one, failures: 2 };
+  await store.memo.set('c_0000000000000001', one, 1);
+  assert.deepEqual(await store.memo.get('c_0000000000000001', 2), { value: null, unanswered: false, malformed: false }, 'a format-1 memo was read under format 2');
+  await store.memo.set('c_0000000000000001', two, 2);
+  assert.deepEqual(core.values.get('rex-spider-gemini-detail-memo-c_0000000000000001-f2'), two);
+  assert.deepEqual(core.values.get('rex-spider-gemini-detail-memo-c_0000000000000001'), one);
+  assert.deepEqual(await store.memo.get('c_0000000000000001', 2), { value: two, unanswered: false, malformed: false });
+  assert.deepEqual(await store.memo.get('c_0000000000000001', 1), { value: one, unanswered: false, malformed: false });
+  await store.memo.clear('c_0000000000000001', 2);
+  assert.deepEqual([core.values.get('rex-spider-gemini-detail-memo-c_0000000000000001-f2'), core.values.get('rex-spider-gemini-detail-memo-c_0000000000000001')], [null, one]);
 });
 
 test('log lines name a key\'s kind, never the chat id in it', { timeout: 2000 }, async () => {
   const lines: string[] = [];
   const store = createStore(rexCore({ open: false }).handleMessage, { deadlineMs: 20, log: (line) => lines.push(line) });
-  await store.memo.get('c_0000000000000001');
-  await store.memo.set('c_0000000000000001', { ended: 1, at: 1, retryMs: 1, failures: 1 });
+  await store.memo.get('c_0000000000000001', 1);
+  await store.memo.set('c_0000000000000001', { ended: 1, at: 1, retryMs: 1, failures: 1 }, 1);
   assert.ok(lines.length >= 2, 'Test setup invalid: nothing was logged, so the absence below would mean nothing');
   assert.ok(lines.every((line) => !line.includes('c_0000000000000001')), lines.join('\n'));
   assert.ok(lines.every((line) => line.includes('rex-spider-gemini-detail-memo')), lines.join('\n'));
@@ -162,8 +178,8 @@ test('memo fields of the wrong form, and arrays dressed as records, read as malf
   const store = createStore(core.handleMessage, { log: quiet });
   const good = { ended: 1700000000000, at: 1700000100000, retryMs: 86_400_000, failures: 1 };
   for (const bad of [{ ...good, failures: 0 }, { ...good, ended: -1 }, { ...good, at: 1.5 }, Object.assign([], good)]) {
-    core.values.set(memoKey('c_0000000000000001'), bad);
-    assert.deepEqual(await store.memo.get('c_0000000000000001'), { value: null, unanswered: false, malformed: true }, JSON.stringify(bad));
+    core.values.set(memoKey('c_0000000000000001', 1), bad);
+    assert.deepEqual(await store.memo.get('c_0000000000000001', 1), { value: null, unanswered: false, malformed: true }, JSON.stringify(bad));
   }
   core.values.set('rex-spider-gemini-mode', Object.assign([], { mode: 'summary', since: 1 }));
   assert.deepEqual(await store.mode.get(), { value: null, unanswered: false, malformed: true });

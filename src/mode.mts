@@ -7,6 +7,12 @@
 // in the store, so a browser that was offline when the config changed still
 // gets the full window. A browser that has never stored a mode, such as one
 // updated from a build that only sent summaries, counts as switching then.
+//
+// The keys are also per data format (format.mts), and only the pass's format
+// is looked up. After a change of format a chat in the crawl window holds no
+// key of the new format in either mode, so it is sent again once in the
+// served mode, however long ago it was last used and whether or not the mode
+// changed too. Within one format the rule above applies unchanged.
 import type { DateString } from '@bric/rex-types/types';
 
 import { uploadKeyId } from './keys.mts';
@@ -40,16 +46,16 @@ export async function resendSince(store: Pick<GeminiStore, 'mode'>, served: Mode
 // rex-spider's checkIfAlreadyTransmitted, or a test's stand-in.
 export type Transmitted = (id: string, ended: DateString) => Promise<boolean>;
 
-// Whether a chat in the crawl window needs nothing this pass: it was sent in
-// the served mode at this last-message time, or sent in the other mode at
-// this time and last used more than RESEND_WINDOW_MS before the switch. With
-// no start for this pass (since null), a chat sent in the other mode is held
-// back rather than sent.
-export async function sentAlready(chatId: string, ended: DateString, served: Mode, since: number | null, transmitted: Transmitted): Promise<boolean> {
-  if (await transmitted(uploadKeyId(chatId, served === 'summary'), ended)) {
+// Whether a chat in the crawl window needs nothing this pass, under the
+// pass's data format: it was sent in the served mode at this last-message
+// time, or sent in the other mode at this time and last used more than
+// RESEND_WINDOW_MS before the switch. With no start for this pass (since
+// null), a chat sent in the other mode is held back rather than sent.
+export async function sentAlready(chatId: string, ended: DateString, served: Mode, since: number | null, transmitted: Transmitted, format: number): Promise<boolean> {
+  if (await transmitted(uploadKeyId(chatId, served === 'summary', format), ended)) {
     return true;
   }
-  if (!(await transmitted(uploadKeyId(chatId, served !== 'summary'), ended))) {
+  if (!(await transmitted(uploadKeyId(chatId, served !== 'summary', format), ended))) {
     return false;
   }
   return since === null || ended.timestamp() < since - RESEND_WINDOW_MS;

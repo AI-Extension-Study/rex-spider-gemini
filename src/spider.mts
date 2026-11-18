@@ -6,6 +6,7 @@ import { REXSpider, type REXSpiderCrawlResult } from '@bric/rex-spider/service-w
 
 import { type AccountSettings, accountSettings } from './account.mts';
 import { createClient } from './client.mts';
+import { dataFormatOf } from './format.mts';
 import { HOME_URL, runPass } from './pass.mts';
 import { sleep } from './pacing.mts';
 import { createStore } from './store.mts';
@@ -38,6 +39,10 @@ export class REXGeminiSpider extends REXSpider {
   // says enabled true (account.mts).
   accountServed: AccountSettings = accountSettings(undefined);
 
+  // The served data_format as of the last config refresh (format.mts): 1
+  // unless it is a whole number from 1 to 999.
+  dataFormatServed: number = dataFormatOf(undefined);
+
   // rex-spider calls this on each refresh whose config has a block for this
   // spider or a default one. With neither, the mode last served stays until
   // the worker restarts, as enabled does.
@@ -48,10 +53,16 @@ export class REXGeminiSpider extends REXSpider {
     // rex-spider's configuration type has no account key, so the served
     // block is read as unknown and checked in account.mts.
     this.accountServed = accountSettings('account' in configuration ? configuration.account : undefined);
+    // Nor a data_format key: read as unknown and checked in format.mts.
+    this.dataFormatServed = dataFormatOf('data_format' in configuration ? configuration.data_format : undefined);
   }
 
   account(): AccountSettings {
     return this.accountServed;
+  }
+
+  dataFormat(): number {
+    return this.dataFormatServed;
   }
 
   justSummarize(): boolean {
