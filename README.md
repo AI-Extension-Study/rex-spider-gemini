@@ -64,7 +64,7 @@ Each mode has its own upload key: the bare chat id in summary mode, the key earl
 | 1 | `<chat id>` | `<chat id>-detail` |
 | n > 1 | `<chat id>-f<n>` | `<chat id>-detail-f<n>` |
 
-A pass reads the format once, when it starts, and looks up only that format's keys. So after a change of format every chat in the crawl window has no key in either mode, and goes out once more in the served mode, however long ago it was last used and whether or not the mode changed too; in detail mode that is a read of every chat, over as many passes as the 360 s reading budget takes. Within one format, a switch of mode re-sends the last 90 days, as above. A failed detail read's summary is checked against the summary key of the pass's format. The account record's hash covers `format_version`, so the first read under a new format sends it.
+A pass reads the format once, when it starts, and looks up only that format's keys. So after a change of format every chat in the crawl window has no key in either mode, and goes out once more in the served mode, however long ago it was last used and whether or not the mode changed too; in detail mode that is a read of every chat, over as many passes as the 360 s reading budget takes. Within one format, a switch of mode re-sends the last 90 days, as above. A failed detail read's summary is checked against the summary key of the pass's format, and the hold of 1 or 7 days it starts is kept per format too (`rex-spider-gemini-detail-memo-<chat id>`, with `-f<n>` above format 1), so a hold from the old format does not keep a chat from being read under the new one. The account record's hash covers `format_version`, so the first read under a new format sends it.
 
 ## The account record
 

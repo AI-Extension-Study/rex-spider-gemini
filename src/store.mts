@@ -60,10 +60,11 @@ export interface GeminiStore {
     get(): Promise<Read<ModeRecord>>;
     set(record: ModeRecord): Promise<Write>;
   };
+  // Each call names the data format the memo is kept under (keys.mts, memoKey).
   readonly memo: {
-    get(chatId: string): Promise<Read<DetailMemo>>;
-    set(chatId: string, memo: DetailMemo): Promise<Write>;
-    clear(chatId: string): Promise<Write>;
+    get(chatId: string, format: number): Promise<Read<DetailMemo>>;
+    set(chatId: string, memo: DetailMemo, format: number): Promise<Write>;
+    clear(chatId: string, format: number): Promise<Write>;
   };
   readonly account: {
     get(): Promise<Read<AccountState>>;
@@ -157,12 +158,12 @@ export function createStore(handleMessage: HandleMessage, { deadlineMs = STORE_D
       get: () => typed(MODE_KEY, isModeRecord),
       set: (record) => set(MODE_KEY, record),
     },
-    // async, so that a bad chat id rejects rather than throws.
+    // async, so that a bad chat id or format rejects rather than throws.
     memo: {
-      get: async (chatId) => typed(memoKey(chatId), isDetailMemo),
-      set: async (chatId, memo) => set(memoKey(chatId), memo),
+      get: async (chatId, format) => typed(memoKey(chatId, format), isDetailMemo),
+      set: async (chatId, memo, format) => set(memoKey(chatId, format), memo),
       // rex-core has no delete; null reads back as nothing.
-      clear: async (chatId) => set(memoKey(chatId), null),
+      clear: async (chatId, format) => set(memoKey(chatId, format), null),
     },
     account: {
       get: () => typed(ACCOUNT_KEY, isAccountState),

@@ -119,7 +119,9 @@ function framework({ account = { enabled: false, intervalMinutes: 60 } as Accoun
 // memoUnanswered: memo reads get none; memoUnkept: memo writes fail;
 // malformed: chats whose memo holds something that is not a memo;
 // accountState: the stored account state; accountUnanswered: its reads get
-// no answer.
+// no answer. memos and malformed are keyed by chat id for format 1, and by
+// <chat id>-f<n> for format n, as the store keys them (keys.mts, memoKey).
+const memoBookKey = (chatId: string, format = 1) => (format === 1 ? chatId : `${chatId}-f${format}`);
 function fakeStore({ stored = null as ModeRecord | null, unanswered = false, memos = {} as Record<string, DetailMemo>, memoUnanswered = false, memoUnkept = false, malformed = [] as string[], accountState = null as AccountState | null, accountUnanswered = false } = {}) {
   let value = stored;
   let accountValue = accountState;
@@ -145,21 +147,23 @@ function fakeStore({ stored = null as ModeRecord | null, unanswered = false, mem
       },
     },
     memo: {
-      get: async (chatId: string) => {
+      get: async (chatId: string, format?: number) => {
         counts.memoGets += 1;
-        if (malformed.includes(chatId)) return { value: null, unanswered: false, malformed: true };
-        return { value: memoUnanswered ? null : book.get(chatId) ?? null, unanswered: memoUnanswered, malformed: false };
+        const key = memoBookKey(chatId, format);
+        if (malformed.includes(key)) return { value: null, unanswered: false, malformed: true };
+        return { value: memoUnanswered ? null : book.get(key) ?? null, unanswered: memoUnanswered, malformed: false };
       },
-      set: async (chatId: string, memo: DetailMemo) => {
+      set: async (chatId: string, memo: DetailMemo, format?: number) => {
         counts.memoSets += 1;
         if (memoUnkept) return { ok: false, unanswered: false };
-        book.set(chatId, memo);
+        book.set(memoBookKey(chatId, format), memo);
         return { ok: true, unanswered: false };
       },
-      clear: async (chatId: string) => {
+      clear: async (chatId: string, format?: number) => {
         counts.memoClears += 1;
-        book.delete(chatId);
-        malformed.splice(0, malformed.length, ...malformed.filter((id) => id !== chatId));
+        const key = memoBookKey(chatId, format);
+        book.delete(key);
+        malformed.splice(0, malformed.length, ...malformed.filter((id) => id !== key));
         return { ok: true, unanswered: false };
       },
     },
@@ -220,17 +224,17 @@ async function pass(fake: ReturnType<typeof client>, side: ReturnType<typeof fra
         },
       },
       memo: {
-        get: (chatId) => {
+        get: (chatId, format) => {
           clock += storeCallMs;
-          return store.memo.get(chatId);
+          return store.memo.get(chatId, format);
         },
-        set: (chatId, memo) => {
+        set: (chatId, memo, format) => {
           side.events.push(`memo ${chatId}`);
-          return store.memo.set(chatId, memo);
+          return store.memo.set(chatId, memo, format);
         },
-        clear: (chatId) => {
+        clear: (chatId, format) => {
           side.events.push(`clear ${chatId}`);
-          return store.memo.clear(chatId);
+          return store.memo.clear(chatId, format);
         },
       },
     },
@@ -1132,7 +1136,7 @@ test('switching detail, summary, detail sends each chat once in each mode it is 
 // Failed reads: the summary record in the detail's place, a memo that holds
 // the chat back, and the stops.
 const ERROR_READ: Answer = { kind: 'ok', status: 200, text: batchResponse(wrbError('hNvQHb', 5)) };
-const memoOf = (store: ReturnType<typeof fakeStore>, n: number) => store.memos.get(chatId(n));
+const memoOf = (store: ReturnType<typeof fakeStore>, n: number, format = 1) => store.memos.get(memoBookKey(chatId(n), format));
 const STOPPED = 'Crawl stopped: detail reads failed.';
 
 test('a failed read writes its memo after the wait that follows it, as a stamp is written', async () => {
@@ -1628,15 +1632,15 @@ test('format 2: a failed read sends its summary, as format 2, when only format-1
   const first = await pass(listed(), side, {}, { store });
   assert.deepEqual(sentAs(first), [[chatId(1), true, 2]]);
   // The fallback's key is not stamped (sendDetails), so the memo is what holds it.
-  assert.deepEqual([keysOf(side), memoOf(store, 1)?.failures], [[], 1]);
+  assert.deepEqual([keysOf(side), memoOf(store, 1, 2)?.failures], [[], 1]);
   const second = await pass(listed(), side, {}, { store, now: NOW + 8 * DAY });
-  assert.deepEqual([second.sent, memoOf(store, 1)?.failures], [[], 2]);
+  assert.deepEqual([second.sent, memoOf(store, 1, 2)?.failures], [[], 2]);
 });
 
 test('format 2: a failed read sends no summary when the format-2 summary key is held at this last message', async () => {
   const store = fakeStore();
   const run = await pass(client({ main: listPage(entries(1)), reads: { [chatId(1)]: ERROR_READ } }), framework({ summarize: false, format: 2, held: [[`${chatId(1)}-f2`, T * 1000]] }), {}, { store });
-  assert.deepEqual([run.sent, memoOf(store, 1)?.failures], [[], 1]);
+  assert.deepEqual([run.sent, memoOf(store, 1, 2)?.failures], [[], 1]);
 });
 
 test('format 2: the account record carries format 2, and its first read under format 2 sends it though format 1\'s record went out an hour ago', async () => {
@@ -1653,4 +1657,30 @@ test('format 2: the account record carries format 2, and its first read under fo
   assert.deepEqual(two.run.accounts, [accountRecord(true, READ_AT, 2)]);
   assert.deepEqual(two.store.accountWrites, [{ hash: await accountHash(two.run.accounts[0]), sentAt: READ_AT, readAt: READ_AT }]);
   assert.notEqual(two.store.accountWrites[0].hash, formatOne);
+});
+
+// The memo of a failed read is kept per data format, as the upload keys are.
+test('a memo holds its chat back only under its own format: under format 2 a format-1 memo does not, and a format-2 memo does as one of format 1 does under format 1', async () => {
+  const held: DetailMemo = { ended: T * 1000, at: NOW - 1000, retryMs: DAY, failures: 1 };
+  const cases: [string, number, Record<string, DetailMemo>, number][] = [
+    ['format 1, a format-1 memo', 1, { [chatId(1)]: held }, 0],
+    ['format 2, a format-1 memo', 2, { [chatId(1)]: held }, 1],
+    ['format 2, a format-2 memo', 2, { [`${chatId(1)}-f2`]: held }, 0],
+    ['format 1, a format-2 memo', 1, { [`${chatId(1)}-f2`]: held }, 1],
+  ];
+  for (const [what, format, memos, reads] of cases) {
+    const fake = client({ main: listPage(entries(1)) });
+    await pass(fake, framework({ summarize: false, format }), {}, { store: fakeStore({ memos }) });
+    assert.equal(readsOf(fake).length, reads, what);
+  }
+});
+
+test('format 2: a failed read writes a format-2 memo, and a successful read clears that one and leaves the format-1 memo', async () => {
+  const store = fakeStore({ memos: { [chatId(1)]: { ended: T * 1000, at: NOW - 1000, retryMs: DAY, failures: 1 } } });
+  await pass(client({ main: listPage(entries(2)), reads: { [chatId(2)]: ERROR_READ } }), framework({ summarize: false, format: 2 }), {}, { store });
+  assert.deepEqual([...store.memos.keys()].sort(), [chatId(1), `${chatId(2)}-f2`]);
+  assert.equal(memoOf(store, 2, 2)?.failures, 1);
+  const again = fakeStore({ memos: { [chatId(1)]: { ended: T * 1000, at: NOW - 1000, retryMs: DAY, failures: 1 }, [`${chatId(1)}-f2`]: { ended: (T - 60) * 1000, at: NOW - 1000, retryMs: DAY, failures: 1 } } });
+  await pass(client({ main: listPage(entries(1)) }), framework({ summarize: false, format: 2 }), {}, { store: again });
+  assert.deepEqual([...again.memos.keys()], [chatId(1)]);
 });

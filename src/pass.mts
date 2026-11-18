@@ -332,7 +332,7 @@ type Pending =
 // read the chat again at once and send its summary again.
 async function memoKept(ctx: Sending, chatId: string, memo: DetailMemo): Promise<boolean> {
   touch(ctx.deps.keepAlive, ctx.log);
-  const answer = await ctx.deps.store.memo.set(chatId, memo);
+  const answer = await ctx.deps.store.memo.set(chatId, memo, ctx.format);
   if (!answer.ok) {
     ctx.log('a detail memo was not kept; sending stops for this pass');
   }
@@ -386,7 +386,8 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
     }
     const endedMs = item.endedSec * 1000;
     touch(deps.keepAlive, log);
-    const memo = await store.memo.get(item.id);
+    // The memo of the pass's format: one of another format holds nothing back.
+    const memo = await store.memo.get(item.id, ctx.format);
     if (memo.unanswered) {
       log('a detail memo got no answer; its chat is read in a later pass');
       continue;
@@ -442,7 +443,7 @@ async function sendDetails(ctx: Sending, items: readonly ListItem[]): Promise<Se
       failedInARow = 0;
       if (memo.value !== null || memo.malformed) {
         touch(deps.keepAlive, log);
-        await store.memo.clear(item.id);
+        await store.memo.clear(item.id, ctx.format);
       }
       const record = buildDetailRecord(item, read, ctx.format);
       if (dispatched(ctx, record)) {
