@@ -5,7 +5,7 @@ import { type DateString } from '@bric/rex-types/types';
 
 import { type AccountRecord, type AccountSettings, type AccountState, accountHash } from '../../src/account.mts';
 import { type Answer } from '../../src/client.mts';
-import { type PassFramework, runPass } from '../../src/pass.mts';
+import { PASS_LIMITS, type PassFramework, runPass } from '../../src/pass.mts';
 import { parseRead } from '../../src/read.mts';
 import { type GeminiRecord } from '../../src/record.mts';
 import { type DetailMemo, type ModeRecord } from '../../src/store.mts';
@@ -26,7 +26,7 @@ const EXPIRED_READ: Answer = { kind: 'ok', status: 200, text: `)]}'\n\n90\n[["wr
 const readOf = (id: string): Answer => ({ kind: 'ok', status: 200, text: readResponse([exchange({ chat: id, response: 1, seconds: T - 60 })]) });
 // What the account call (ESY5D) answers: Gemini Apps Activity on or off.
 const activity = (on: unknown): Answer => ({ kind: 'ok', status: 200, text: batchResponse(wrb('ESY5D', [[null, null, null, null, on]])) });
-const LIMITS = { settleMs: 1500, batch: 25, storeMs: 20, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: 30 * 60_000 };
+const LIMITS = { settleMs: 1500, batch: 25, storeMs: 20, detailBudgetMs: 360_000, failedRun: 3, tokenAgeMs: PASS_LIMITS.tokenAgeMs };
 
 // The spider's two list calls answered by variant: [1,null,1] first, then the
 // main list [0,null,1], each a single page unless a cursor is scripted. A
@@ -320,7 +320,7 @@ test('the list calls carry this pass\'s page token and request id, and a later p
   assert.ok(second.calls.slice(1).every((call) => call.includes('at=PAGE-TOKEN:2 ')), second.calls.join('\n'));
 });
 
-test('a list answer that is not a list, or a list call that fails, ends the pass with an error and sends nothing', async () => {
+test('a list answer that is not a list, or a list call that fails, at the first list call or before any chat in the window was listed, ends the pass with an error and sends nothing', async () => {
   const cases: [Answer, string][] = [
     [{ kind: 'ok', status: 200, text: '<html></html>' }, 'Error encountered parsing conversations: Received invalid response for conversation API.'],
     [{ kind: 'timeout' }, 'Error encountered parsing conversations: Unable to crawl the conversation list (timeout).'],
@@ -328,13 +328,35 @@ test('a list answer that is not a list, or a list call that fails, ends the pass
     [{ kind: 'ok', status: 500, text: '' }, 'Error encountered parsing conversations: List fetch failed (status 500).'],
   ];
   for (const [answer, reason] of cases) {
-    // Chats listed before the failure lie outside the window only for the
-    // HTTP error, whose outcome depends on whether any was in it.
-    const http = answer.kind === 'ok' && answer.status === 500;
-    const side = framework({ windowStart: http ? Number.MAX_SAFE_INTEGER : 0 });
-    const run = await pass(client({ other: listPage(entries(1)), main: answer }), side);
-    assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length, run.outcome.crawledIds], [-1, reason, 0, []], reason);
-    if (!http) assert.equal(side.counts.reads, 0, `${reason}: chats were checked after the list failed`);
+    for (const [where, fake, side] of [
+      ['at the first list call', client({ other: answer, main: listPage(entries(1)) }), framework()],
+      ['after chats outside the window', client({ other: listPage(entries(1)), main: answer }), framework({ windowStart: Number.MAX_SAFE_INTEGER })],
+    ] as const) {
+      const run = await pass(fake, side);
+      assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.sent.length, run.outcome.crawledIds], [-1, reason, 0, []], `${reason} ${where}`);
+      assert.equal(side.counts.reads, 0, `${reason} ${where}: a key was read after the list failed`);
+    }
+  }
+});
+
+test('a timeout, a network error or an answer that is not a list after chats in the window were listed sends them and reports partial', async () => {
+  const cases: [string, Answer][] = [
+    ['a timeout', { kind: 'timeout' }],
+    ['a network error', { kind: 'network' }],
+    ['an answer without the guard', { kind: 'ok', status: 200, text: '<html></html>' }],
+    ['a guarded answer with no list frame', { kind: 'ok', status: 200, text: batchResponse() }],
+  ];
+  for (const [what, answer] of cases) {
+    for (const [where, fake] of [
+      ['on a later page of the main list', client({ main: listPage(entries(2), 'A'), more: { A: answer } })],
+      ['on the main list\'s first page, after [1,null,1] listed chats', client({ other: listPage(entries(2)), main: answer })],
+    ] as const) {
+      const run = await pass(fake, framework());
+      assert.deepEqual(run.outcome, { crawledCount: 2, crawledIds: [chatId(1), chatId(2)], reason: 'Full fetch unsuccessful. Partial results returned.', issue: null }, `${what} ${where}`);
+      assert.deepEqual(run.sent.map((record) => record.identifier), [chatId(2), chatId(1)], `${what} ${where}`);
+      const kind = answer.kind === 'ok' ? 'not-a-list' : answer.kind;
+      assert.ok(run.lines.includes(`the list walk stopped early (${kind})`), `${what} ${where}: the stop was not logged:\n${run.lines.join('\n')}`);
+    }
   }
 });
 
@@ -739,7 +761,7 @@ test('a switch-off still ends the pass after the waits have passed the budget', 
   assert.deepEqual([run.outcome.crawledCount, run.outcome.reason, run.outcome.issue], [15, 'Crawl stopped: spider disabled.', null]);
 });
 
-// The page token, read again from the homepage once it is 30 minutes old.
+// The page token, read again from the homepage once it is 25 minutes old.
 const MINUTE = 60_000;
 const RENEWED_PAGE = '<script>WIZ_global_data = {"SNlM0e":"PAGE-TOKEN:2"};</script>';
 const RENEWED: Answer = { kind: 'ok', status: 200, text: RENEWED_PAGE };
@@ -747,26 +769,28 @@ const RENEWED: Answer = { kind: 'ok', status: 200, text: RENEWED_PAGE };
 const tokenCalls = (fake: ReturnType<typeof client>) => fake.calls.filter((call) => !call.startsWith('list'))
   .map((call) => (call.startsWith('GET') ? 'homepage' : `read ${call.split(' ')[1]} ${/ at=(\S+)/.exec(call)?.[1]}`));
 
-test('the page token is read again from the homepage before a read once it is older than 30 minutes, and not before', async () => {
-  // At a 7-minute crawl_delay the walk's wait ends at 7 minutes and the
-  // reads go out at 14, 21 and 28: the token never gets 30 minutes old.
+test('the page token is read again from the homepage before a read once it is older than 25 minutes, and not before', async () => {
+  assert.equal(PASS_LIMITS.tokenAgeMs, 25 * MINUTE);
+  // At a 6-minute crawl_delay the walk's wait ends at 6 minutes and the
+  // reads go out at 12, 18 and 24: the token never gets 25 minutes old.
   const young = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
-  await pass(young, framework({ summarize: false, crawlDelay: 7 * MINUTE }));
-  assert.deepEqual(tokenCalls(young), ['homepage', ...newest(3, 3).map((id) => `read ${id} PAGE-TOKEN:1`)], 'under 30 minutes');
-  // At 10 minutes two reads go out at 20 and 30: a token exactly 30 minutes
-  // old is not read again.
+  await pass(young, framework({ summarize: false, crawlDelay: 6 * MINUTE }));
+  assert.deepEqual(tokenCalls(young), ['homepage', ...newest(3, 3).map((id) => `read ${id} PAGE-TOKEN:1`)], 'under 25 minutes');
+  // At 8 minutes 20 s two reads go out at 16:40 and 25:00: a token exactly
+  // 25 minutes old is not read again.
   const exact = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(2)) });
-  await pass(exact, framework({ summarize: false, crawlDelay: 10 * MINUTE }));
-  assert.deepEqual(tokenCalls(exact), ['homepage', ...newest(2, 2).map((id) => `read ${id} PAGE-TOKEN:1`)], 'exactly 30 minutes');
-  // A first read that takes 1 ms puts the second at 30 minutes and 1 ms.
+  await pass(exact, framework({ summarize: false, crawlDelay: 500_000 }));
+  assert.deepEqual(tokenCalls(exact), ['homepage', ...newest(2, 2).map((id) => `read ${id} PAGE-TOKEN:1`)], 'exactly 25 minutes');
+  // A first read that takes 1 ms puts the second at 25 minutes and 1 ms.
   const justPast = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(2)) });
-  await pass(justPast, framework({ summarize: false, crawlDelay: 10 * MINUTE }), {}, { readMs: 1 });
-  assert.deepEqual(tokenCalls(justPast), ['homepage', `read ${chatId(2)} PAGE-TOKEN:1`, 'homepage', `read ${chatId(1)} PAGE-TOKEN:2`], '30 minutes and 1 ms');
-  // At 11 minutes they go out at 22, 33 and 44: the token is 33 minutes old
-  // at the second read, and the one read then is 11 minutes old at the third.
+  await pass(justPast, framework({ summarize: false, crawlDelay: 500_000 }), {}, { readMs: 1 });
+  assert.deepEqual(tokenCalls(justPast), ['homepage', `read ${chatId(2)} PAGE-TOKEN:1`, 'homepage', `read ${chatId(1)} PAGE-TOKEN:2`], '25 minutes and 1 ms');
+  // At 11 minutes the token is 33 minutes old at the second read. The read
+  // after the re-read waits crawl_delay, so it goes out at 44, and the third
+  // at 55, when the token read at 33 is 22 minutes old.
   const old = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
   await pass(old, framework({ summarize: false, crawlDelay: 11 * MINUTE }));
-  assert.deepEqual(tokenCalls(old), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage', `read ${chatId(2)} PAGE-TOKEN:2`, `read ${chatId(1)} PAGE-TOKEN:2`], 'past 30 minutes');
+  assert.deepEqual(tokenCalls(old), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage', `read ${chatId(2)} PAGE-TOKEN:2`, `read ${chatId(1)} PAGE-TOKEN:2`], 'past 25 minutes');
 });
 
 test('a page token that cannot be read again ends the reads, as an expired session does', async () => {
@@ -801,6 +825,159 @@ test('a switch-off is read before the page token is read again, and again before
   const second = await pass(during, framework({ summarize: false, crawlDelay: 11 * MINUTE, enabled: () => tokenCalls(during).filter((call) => call === 'homepage').length < 2 }));
   assert.deepEqual(tokenCalls(during), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage'], 'during the re-read');
   assert.deepEqual([second.outcome.crawledCount, second.outcome.reason], [1, 'Crawl stopped: spider disabled.'], 'during the re-read');
+});
+
+// A main list of three pages at an 11-minute crawl_delay: [1,null,1] goes
+// out at 0 and the main list's pages at 11, 22 and 33 minutes, so the token
+// is 33 minutes old at the third.
+const threePages = (home: Answer[]) => client({ home, main: listPage([entries(3)[2]], 'A'), more: { A: listPage([entries(3)[1]], 'B'), B: listPage([entries(3)[0]]) } });
+// A pass's homepage reads and list calls, each list call with the token it carried.
+const walkCalls = (fake: ReturnType<typeof client>) => fake.calls.filter((call) => !call.startsWith('read'))
+  .map((call) => (call.startsWith('GET') ? 'homepage' : `list ${call.split(' ')[1]} ${call.split(' ')[2]} ${/ at=(\S+)/.exec(call)?.[1]}`));
+const RENEWED_AGAIN: Answer = { kind: 'ok', status: 200, text: '<script>WIZ_global_data = {"SNlM0e":"PAGE-TOKEN:3"};</script>' };
+
+test('the walk reads the page token again before a list call once it is older than 25 minutes, and the calls after carry the new one', async () => {
+  const fake = threePages([HOMEPAGE, RENEWED]);
+  const run = await pass(fake, framework({ crawlDelay: 11 * MINUTE }));
+  assert.deepEqual(walkCalls(fake), [
+    'homepage',
+    'list [1,null,1] null PAGE-TOKEN:1',
+    'list [0,null,1] null PAGE-TOKEN:1',
+    'list [0,null,1] A PAGE-TOKEN:1',
+    'homepage',
+    'list [0,null,1] B PAGE-TOKEN:2',
+  ]);
+  assert.deepEqual(run.outcome, { crawledCount: 3, crawledIds: [chatId(3), chatId(2), chatId(1)], reason: 'Fetch successful.', issue: null });
+});
+
+test('a page token that cannot be read again during the walk ends it there, and the chats listed go out as a partial pass', async () => {
+  const cases: [string, Answer][] = [
+    ['signed out', { kind: 'ok', status: 200, text: '<html>Sign in</html>' }],
+    // The refusing page holds a token, so only its status can refuse it.
+    ['refused', { kind: 'ok', status: 403, text: RENEWED_PAGE }],
+    ['no answer', { kind: 'timeout' }],
+    ['a network error', { kind: 'network' }],
+  ];
+  for (const [what, answer] of cases) {
+    const fake = threePages([HOMEPAGE, answer]);
+    const run = await pass(fake, framework({ crawlDelay: 11 * MINUTE }));
+    assert.deepEqual(walkCalls(fake).slice(-2), ['list [0,null,1] A PAGE-TOKEN:1', 'homepage'], `${what}: a list call went out after the failed re-read`);
+    assert.deepEqual(run.outcome, { crawledCount: 2, crawledIds: [chatId(3), chatId(2)], reason: 'Full fetch unsuccessful. Partial results returned.', issue: null }, what);
+    assert.ok(run.lines.includes('the list walk stopped early (token)'), `${what}:\n${run.lines.join('\n')}`);
+  }
+  // With no chat in the window listed by then, the pass has no reading.
+  const outside = await pass(threePages([HOMEPAGE, { kind: 'timeout' }]), framework({ crawlDelay: 11 * MINUTE, windowStart: Number.MAX_SAFE_INTEGER }));
+  const reason = 'Error encountered parsing conversations: List read only in part, with no conversation in the crawl window.';
+  assert.deepEqual(outside.outcome, { crawledCount: -1, crawledIds: [], reason, issue: reason });
+});
+
+test('a switch-off served while the walk reads the page token again stops the walk before its next list call', async () => {
+  const fake = threePages([HOMEPAGE, RENEWED]);
+  const run = await pass(fake, framework({ crawlDelay: 11 * MINUTE, enabled: () => fake.calls.filter((call) => call.startsWith('GET')).length < 2 }));
+  assert.deepEqual(walkCalls(fake).slice(-2), ['list [0,null,1] A PAGE-TOKEN:1', 'homepage']);
+  assert.deepEqual(run.outcome, { crawledCount: -1, crawledIds: [], reason: 'Crawl stopped: spider disabled.', issue: null });
+});
+
+test('the detail reads go on with the token the walk read again, and read it again once that one is 25 minutes old', async () => {
+  // Read again at 33 minutes, before the main list's third page, which goes
+  // out at 44 after the wait. The first read goes out at 55, when the token
+  // is 22 minutes old; the second is due at 66, when it is 33.
+  const fake = threePages([HOMEPAGE, RENEWED, RENEWED_AGAIN]);
+  await pass(fake, framework({ summarize: false, crawlDelay: 11 * MINUTE }));
+  assert.deepEqual(tokenCalls(fake), ['homepage', 'homepage', `read ${chatId(3)} PAGE-TOKEN:2`, 'homepage', `read ${chatId(2)} PAGE-TOKEN:3`, `read ${chatId(1)} PAGE-TOKEN:3`]);
+});
+
+// Puts the pass's homepage reads and list calls in side.events, beside its
+// waits and chat reads, so a test sees all of them in one order.
+function traced(fake: ReturnType<typeof client>, side: ReturnType<typeof framework>) {
+  const { get, postForm } = fake;
+  fake.get = (url) => {
+    side.events.push('homepage');
+    return get(url);
+  };
+  fake.postForm = (url, body) => {
+    const [rpcid, json] = JSON.parse(body.get('f.req') ?? '')[0][0] as [string, string];
+    if (rpcid === 'MaZiqc') side.events.push(`list ${String((JSON.parse(json) as unknown[])[1])}`);
+    return postForm(url, body);
+  };
+  return fake;
+}
+
+test('a page token read again is followed by a crawl_delay wait before the next request, in the walk and in the detail reads', async () => {
+  const wait = `wait ${11 * MINUTE}`;
+  const walkSide = framework({ crawlDelay: 11 * MINUTE });
+  await pass(traced(threePages([HOMEPAGE, RENEWED]), walkSide), walkSide);
+  assert.deepEqual(walkSide.events.slice(0, 10), ['homepage', 'list null', wait, 'list null', wait, 'list A', wait, 'homepage', wait, 'list B'], 'in the walk');
+  // Read again before the second read, at 33 minutes.
+  const readSide = framework({ summarize: false, crawlDelay: 11 * MINUTE });
+  await pass(traced(client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) }), readSide), readSide);
+  assert.deepEqual(readSide.events.slice(0, 13), [
+    'homepage', 'list null', wait, 'list null',
+    wait, `read ${chatId(3)}`, `dispatch ${chatId(3)}`,
+    wait, `stamp ${chatId(3)}-detail`, 'homepage', wait, `read ${chatId(2)}`, `dispatch ${chatId(2)}`,
+  ], 'in the detail reads');
+});
+
+test('summary mode served during the wait after a re-read of the page token ends the reads before the next read, as at any read', async () => {
+  let summary = false;
+  const fake = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(3)) });
+  const homepages = () => tokenCalls(fake).filter((call) => call === 'homepage').length;
+  const side = framework({ summarize: () => summary, crawlDelay: 11 * MINUTE });
+  // The token is read again before the second read, at 33 minutes; summary
+  // mode is served during the wait that follows that homepage read.
+  const run = await pass(fake, side, {}, { slept: (ms) => {
+    if (homepages() === 2) summary = true;
+    return Number(ms) || 0;
+  } });
+  assert.deepEqual(tokenCalls(fake), ['homepage', `read ${chatId(3)} PAGE-TOKEN:1`, 'homepage'], 'a detail read went out after summary mode was served');
+  assert.ok(run.lines.includes('summary mode was served during the detail reads; a later pass sends the chats not read'), run.lines.join('\n'));
+  assert.deepEqual(keysOf(side), [`${chatId(3)}-detail`]);
+  assert.deepEqual([run.outcome.crawledCount, run.outcome.reason], [1, 'Fetch successful.']);
+});
+
+// The list stops after which the detail reads first read the page token
+// again: each may mean the site would answer the reads the same way, a
+// sign-in page answered with HTTP 200 included.
+const LATE_STOPS: [string, Answer][] = [
+  ['timeout', { kind: 'timeout' }],
+  ['network', { kind: 'network' }],
+  ['not-a-list', { kind: 'ok', status: 200, text: '<html>Sign in</html>' }],
+  ['http', { kind: 'ok', status: 500, text: '' }],
+];
+
+test('after a list call that failed once chats in the window were listed, the detail reads read the page token again before the first read', async () => {
+  for (const [kind, answer] of LATE_STOPS) {
+    const fake = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(2), 'A'), more: { A: answer } });
+    const run = await pass(fake, framework({ summarize: false }));
+    assert.deepEqual(tokenCalls(fake), ['homepage', 'homepage', `read ${chatId(2)} PAGE-TOKEN:2`, `read ${chatId(1)} PAGE-TOKEN:2`], kind);
+    assert.deepEqual(run.outcome, { crawledCount: 2, crawledIds: [chatId(1), chatId(2)], reason: 'Full fetch unsuccessful. Partial results returned.', issue: null }, kind);
+  }
+});
+
+test('after such a list stop, a page token that cannot be read again sends no read and writes no memo, and the chats wait for a later pass', async () => {
+  for (const [kind, answer] of LATE_STOPS) {
+    for (const [what, home] of [['signed out', { kind: 'ok', status: 200, text: '<html>Sign in</html>' }], ['rate limited', { kind: 'ok', status: 429, text: RENEWED_PAGE }]] as [string, Answer][]) {
+      const fake = client({ home: [HOMEPAGE, home], main: listPage(entries(2), 'A'), more: { A: answer } });
+      const side = framework({ summarize: false });
+      const store = fakeStore();
+      const run = await pass(fake, side, {}, { store });
+      assert.deepEqual(tokenCalls(fake), ['homepage', 'homepage'], `${kind}, ${what}`);
+      assert.deepEqual([run.sent.length, store.memos.size, side.stamped.length], [0, 0, 0], `${kind}, ${what}`);
+      assert.deepEqual(run.outcome, { crawledCount: 0, crawledIds: [chatId(1), chatId(2)], reason: 'Full fetch unsuccessful. Partial results returned.', issue: null }, `${kind}, ${what}`);
+    }
+  }
+});
+
+test('after a list call answered 429, the reads read the page token again, and a read answered 429 sends its summary, holds the chat a day and ends the reads', async () => {
+  const limited: Answer = { kind: 'ok', status: 429, text: '' };
+  const fake = client({ home: [HOMEPAGE, RENEWED], main: listPage(entries(2), 'A'), more: { A: limited }, reads: { [chatId(2)]: limited } });
+  const store = fakeStore();
+  const run = await pass(fake, framework({ summarize: false }), {}, { store });
+  assert.deepEqual(tokenCalls(fake), ['homepage', 'homepage', `read ${chatId(2)} PAGE-TOKEN:2`]);
+  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary]), [[chatId(2), true]]);
+  assert.deepEqual([store.memos.get(chatId(2))?.retryMs, store.memos.get(chatId(2))?.failures, store.memos.size], [DAY, 1, 1]);
+  const wait = 'Crawl stopped: the server asked to wait.';
+  assert.deepEqual(run.outcome, { crawledCount: 1, crawledIds: [chatId(1), chatId(2)], reason: 'Full fetch unsuccessful. Partial results returned.', issue: wait });
 });
 
 test('a switch-off during the reads stops them before the next read, and the record sent last is stamped', async () => {
